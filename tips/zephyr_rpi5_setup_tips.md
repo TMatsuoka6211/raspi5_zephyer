@@ -24,7 +24,7 @@ graph TD
 ```
 1. **環境構築**: 競合のない Python 仮想環境および 64bit ARM クロスコンパイラ（SDK 1.0.0）の導入。
 2. **ビルド成功**: `blinky`（Lチカ）および `hello_world` サンプルのコンパイル。
-3. **書き込みと実機起動**: FAT32/MBRパーティションの流用による、Pi 5 での Zephyr 起動。
+3. **書き込みと実機起動**: WindowsでMBR/FAT32フォーマットしたSDカードから、WSL経由で自動生成された不要なシステムファイルを削除して起動することを確認。
 4. **シリアル通信の確立**: Debug Probe 経由で Windows 側の Tera Term に起動ログ（115200bps）を表示。
 
 ---
@@ -82,9 +82,14 @@ graph TD
 > 💡 **重要 (IMPORTANT)**
 > **事象**: 正しくファイルを置いたつもりでも、起動に失敗し、黒画が表示され、シリアルログが出力されない。
 * **原因**: 
-  1. **`System Volume Information` フォルダの存在**: Windowsが自動作成するこの隠しフォルダが存在すると、Pi 5のブートローダーがファイルスキャンに失敗し、デバイスのオープンエラーを引き起こす。
+  1. **`System Volume Information` フォルダの自動生成**: Windowsでドライブをフォーマット、またはWindows PCに接続（マウント）すると、Windowsがインデックス作成やボリューム復元管理用の隠しフォルダ `System Volume Information` を**自動的かつ強制的に作成**する。このフォルダ構成が、Raspberry Pi 5 のブートローダー（EEPROM）のファイルスキャン処理を阻害し、デバイスの読み込みエラー（デバイスオープン失敗）を発生させる。
 * **対策**: 
-  * **隠しフォルダの削除**: WSL等から `rm -rf "System Volume Information"` コマンドでこのフォルダを完全に削除する。
+  * **WSL側から隠しフォルダを削除する**: WSL上にSDカード（例：Fドライブ）をマウントし、`rm -rf` コマンドでこの隠しフォルダを完全に削除した状態でアンマウントし、起動する。
+    ```bash
+    sudo mount -t drvfs F: /mnt/f
+    rm -rf /mnt/f/System\ Volume\ Information/
+    sudo umount /mnt/f
+    ```
 
 ---
 
