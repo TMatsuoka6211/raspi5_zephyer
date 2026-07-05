@@ -1,0 +1,11 @@
+# Copyright 2026 matsuoka
+# Copyright 2026 matsuoka
+# SPDX-License-Identifier: Apache-2.0
+
+config SDHC_BCM2712
+	bool "Broadcom BCM2712 SDHCI controller driver"
+	default y
+	depends on DT_HAS_BRCM_BCM2712_SDHCI_ENABLED
+	select SDHC_SUPPORTS_NATIVE_MODE
+	help
+	  Enable the Broadcom BCM2712 SDHCI controller driver.
