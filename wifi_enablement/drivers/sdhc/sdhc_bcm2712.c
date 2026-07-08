@@ -99,7 +99,6 @@ static void sdhc_bcm2712_recover_error(const struct device *dev, uint32_t int_st
 	int timeout = 1000;
 	uint8_t reset_bit = 0;
 	uint32_t pin_sel;
-	struct sdhc_bcm2712_data *data = dev->data;
 
 	/* Determine which reset is needed */
 	if (int_status & (0xF << 16)) { /* Command errors: bits 19-16 */
@@ -123,11 +122,11 @@ static void sdhc_bcm2712_recover_error(const struct device *dev, uint32_t int_st
 		/* Re-apply BCM2712 specific config registers after soft reset */
 		pin_sel = sys_read32(DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 		pin_sel &= ~SDIO_CFG_SD_PIN_SEL_MASK;
-		pin_sel |= SDIO_CFG_SD_PIN_SEL_SD;
+		/* Do not set SDIO_CFG_SD_PIN_SEL_SD for non-removable SDIO */
 		sys_write32(pin_sel, DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 
 		/* Force fully re-configure the clock after soft reset to guarantee PLL lock */
-		sdhc_bcm2712_set_clk(dev, data->host_io.clock);
+		/* sdhc_bcm2712_set_clk(dev, data->host_io.clock); */
 	}
 }
 
@@ -235,6 +234,8 @@ static int sdhc_bcm2712_request(const struct device *dev,
 			uint32_t state = sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE);
 			LOG_ERR("Command complete timeout. INT_STATUS: 0x%x, PRESENT_STATE: 0x%x", 
 				int_status, state);
+			/* Perform error recovery reset to unblock the command engine */
+			sdhc_bcm2712_recover_error(dev, 0x00020000);
 			return -ETIMEDOUT;
 		}
 	}
@@ -284,7 +285,7 @@ static int sdhc_bcm2712_set_clk(const struct device *dev, uint32_t hz)
 	/* Select SD mode on BCM2712 SD Pin select register (Config Reg offset 0x44) */
 	pin_sel = sys_read32(DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 	pin_sel &= ~SDIO_CFG_SD_PIN_SEL_MASK;
-	pin_sel |= SDIO_CFG_SD_PIN_SEL_SD;
+	/* Do not set SDIO_CFG_SD_PIN_SEL_SD for non-removable SDIO */
 	sys_write32(pin_sel, DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 
 	/* Get base clock from Capabilities register */
@@ -417,8 +418,9 @@ static int sdhc_bcm2712_set_power(const struct device *dev, struct sdhc_io *ios)
 	/* Wait for power stabilization (at least 20ms) */
 	k_msleep(20);
 
-	LOG_DBG("Power set to ON, reg: 0x%x, ctrl2: 0x%x (voltage req: %d)", 
-		pwr | SDHCI_POWER_ON_BIT, ctrl2, ios->signal_voltage);
+	uint8_t pwr_read = sys_read8(DEVICE_MMIO_GET(dev) + SDHCI_POWER_CONTROL);
+	LOG_DBG("Power set to ON, reg: 0x%x (read: 0x%x), ctrl2: 0x%x (voltage req: %d)", 
+		pwr | SDHCI_POWER_ON_BIT, pwr_read, ctrl2, ios->signal_voltage);
 	return 0;
 }
 
@@ -462,7 +464,8 @@ static int sdhc_bcm2712_get_host_props(const struct device *dev,
 	props->f_min = SDMMC_CLOCK_400KHZ;
 	props->f_max = SD_CLOCK_25MHZ;
 	props->power_delay = config->power_delay_ms;
-	props->host_caps.vol_330_support = true;
+	props->host_caps.vol_180_support = true;
+	props->host_caps.vol_330_support = false;
 	props->is_spi = false;
 
 	return 0;
@@ -490,10 +493,16 @@ static int sdhc_bcm2712_card_busy(const struct device *dev)
 
 static int sdhc_bcm2712_init(const struct device *dev)
 {
+	uint32_t pin_sel;
+
 	DEVICE_MMIO_MAP(dev, K_MEM_CACHE_NONE);
 
 	printk("BCM2712 SDHost driver init at 0x%lx\n",
 		(unsigned long)DEVICE_MMIO_GET(dev));
+
+	/* Log the initial value of SDIO_CFG_SD_PIN_SEL register */
+	pin_sel = sys_read32(DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
+	printk("Initial SDIO_CFG_SD_PIN_SEL: 0x%x\n", pin_sel);
 
 	return sdhc_bcm2712_reset_internal(dev);
 }

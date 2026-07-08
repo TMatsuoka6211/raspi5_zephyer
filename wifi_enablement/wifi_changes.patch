@@ -1,8 +1,8 @@
 diff --git a/boards/raspberrypi/rpi_5/rpi_5_bcm2712.dts b/boards/raspberrypi/rpi_5/rpi_5_bcm2712.dts
-index 339adba011c..63ba0cc02cd 100644
+index 339adba011c..56683a42235 100644
 --- a/boards/raspberrypi/rpi_5/rpi_5_bcm2712.dts
 +++ b/boards/raspberrypi/rpi_5/rpi_5_bcm2712.dts
-@@ -49,3 +49,11 @@
+@@ -49,3 +49,16 @@
  &gpio0_0 {
  	status = "okay";
  };
@@ -14,6 +14,11 @@ index 339adba011c..63ba0cc02cd 100644
 +		reg = <1>;
 +	};
 +};
++
++&gio {
++	status = "okay";
++};
++
 diff --git a/boards/raspberrypi/rpi_5/rpi_5_bcm2712_defconfig b/boards/raspberrypi/rpi_5/rpi_5_bcm2712_defconfig
 index fc82b7f50d2..326ce673a2d 100644
 --- a/boards/raspberrypi/rpi_5/rpi_5_bcm2712_defconfig
@@ -66,10 +71,10 @@ index 00000000000..90567ec8df7
 +	  Enable the Broadcom BCM2712 SDHCI controller driver.
 diff --git a/drivers/sdhc/sdhc_bcm2712.c b/drivers/sdhc/sdhc_bcm2712.c
 new file mode 100644
-index 00000000000..eb261ace21e
+index 00000000000..6c5106c9285
 --- /dev/null
 +++ b/drivers/sdhc/sdhc_bcm2712.c
-@@ -0,0 +1,527 @@
+@@ -0,0 +1,536 @@
 +/*
 + * Copyright 2026 matsuoka
 + *
@@ -171,7 +176,6 @@ index 00000000000..eb261ace21e
 +	int timeout = 1000;
 +	uint8_t reset_bit = 0;
 +	uint32_t pin_sel;
-+	struct sdhc_bcm2712_data *data = dev->data;
 +
 +	/* Determine which reset is needed */
 +	if (int_status & (0xF << 16)) { /* Command errors: bits 19-16 */
@@ -195,11 +199,11 @@ index 00000000000..eb261ace21e
 +		/* Re-apply BCM2712 specific config registers after soft reset */
 +		pin_sel = sys_read32(DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 +		pin_sel &= ~SDIO_CFG_SD_PIN_SEL_MASK;
-+		pin_sel |= SDIO_CFG_SD_PIN_SEL_SD;
++		/* Do not set SDIO_CFG_SD_PIN_SEL_SD for non-removable SDIO */
 +		sys_write32(pin_sel, DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 +
 +		/* Force fully re-configure the clock after soft reset to guarantee PLL lock */
-+		sdhc_bcm2712_set_clk(dev, data->host_io.clock);
++		/* sdhc_bcm2712_set_clk(dev, data->host_io.clock); */
 +	}
 +}
 +
@@ -307,6 +311,8 @@ index 00000000000..eb261ace21e
 +			uint32_t state = sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE);
 +			LOG_ERR("Command complete timeout. INT_STATUS: 0x%x, PRESENT_STATE: 0x%x", 
 +				int_status, state);
++			/* Perform error recovery reset to unblock the command engine */
++			sdhc_bcm2712_recover_error(dev, 0x00020000);
 +			return -ETIMEDOUT;
 +		}
 +	}
@@ -356,7 +362,7 @@ index 00000000000..eb261ace21e
 +	/* Select SD mode on BCM2712 SD Pin select register (Config Reg offset 0x44) */
 +	pin_sel = sys_read32(DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 +	pin_sel &= ~SDIO_CFG_SD_PIN_SEL_MASK;
-+	pin_sel |= SDIO_CFG_SD_PIN_SEL_SD;
++	/* Do not set SDIO_CFG_SD_PIN_SEL_SD for non-removable SDIO */
 +	sys_write32(pin_sel, DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 +
 +	/* Get base clock from Capabilities register */
@@ -489,8 +495,9 @@ index 00000000000..eb261ace21e
 +	/* Wait for power stabilization (at least 20ms) */
 +	k_msleep(20);
 +
-+	LOG_DBG("Power set to ON, reg: 0x%x, ctrl2: 0x%x (voltage req: %d)", 
-+		pwr | SDHCI_POWER_ON_BIT, ctrl2, ios->signal_voltage);
++	uint8_t pwr_read = sys_read8(DEVICE_MMIO_GET(dev) + SDHCI_POWER_CONTROL);
++	LOG_DBG("Power set to ON, reg: 0x%x (read: 0x%x), ctrl2: 0x%x (voltage req: %d)", 
++		pwr | SDHCI_POWER_ON_BIT, pwr_read, ctrl2, ios->signal_voltage);
 +	return 0;
 +}
 +
@@ -534,7 +541,8 @@ index 00000000000..eb261ace21e
 +	props->f_min = SDMMC_CLOCK_400KHZ;
 +	props->f_max = SD_CLOCK_25MHZ;
 +	props->power_delay = config->power_delay_ms;
-+	props->host_caps.vol_330_support = true;
++	props->host_caps.vol_180_support = true;
++	props->host_caps.vol_330_support = false;
 +	props->is_spi = false;
 +
 +	return 0;
@@ -562,10 +570,16 @@ index 00000000000..eb261ace21e
 +
 +static int sdhc_bcm2712_init(const struct device *dev)
 +{
++	uint32_t pin_sel;
++
 +	DEVICE_MMIO_MAP(dev, K_MEM_CACHE_NONE);
 +
 +	printk("BCM2712 SDHost driver init at 0x%lx\n",
 +		(unsigned long)DEVICE_MMIO_GET(dev));
++
++	/* Log the initial value of SDIO_CFG_SD_PIN_SEL register */
++	pin_sel = sys_read32(DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
++	printk("Initial SDIO_CFG_SD_PIN_SEL: 0x%x\n", pin_sel);
 +
 +	return sdhc_bcm2712_reset_internal(dev);
 +}
@@ -598,7 +612,7 @@ index 00000000000..eb261ace21e
 +
 +DT_INST_FOREACH_STATUS_OKAY(SDHC_BCM2712_INIT)
 diff --git a/dts/arm64/broadcom/bcm2712.dtsi b/dts/arm64/broadcom/bcm2712.dtsi
-index 1b151a1da1a..abee9ae78ba 100644
+index 1b151a1da1a..5dea3cd6dc3 100644
 --- a/dts/arm64/broadcom/bcm2712.dtsi
 +++ b/dts/arm64/broadcom/bcm2712.dtsi
 @@ -1,3 +1,4 @@
@@ -606,7 +620,31 @@ index 1b151a1da1a..abee9ae78ba 100644
  /*
   * Copyright 2024 Myeonghyeon Park <myeonghyeon@tsnlab.com>
   *
-@@ -94,6 +95,17 @@
+@@ -68,6 +69,23 @@
+ 			status = "disabled";
+ 		};
+ 
++		gpio1: gpio1@107d508500 {
++			compatible = "simple-bus";
++			reg = <0x10 0x7d508500 0x40>;
++
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			gio: gpio@0 {
++				compatible = "brcm,brcmstb-gpio";
++				reg = <0>;
++				gpio-controller;
++				#gpio-cells = <2>;
++				ngpios = <32>;
++				status = "disabled";
++			};
++		};
++
+ 		gpio2@107d517c00 {
+ 			compatible = "simple-bus";
+ 			reg = <0x10 0x7d517c00 0x40>;
+@@ -94,6 +112,17 @@
  			clocks = <&clk_uart>;
  			status = "disabled";
  		};
@@ -647,10 +685,10 @@ index 00000000000..a7e929208f7
 +  clocks:
 +    required: true
 diff --git a/samples/hello_world/prj.conf b/samples/hello_world/prj.conf
-index b2a4ba59104..6672451894b 100644
+index b2a4ba59104..ad268f4555e 100644
 --- a/samples/hello_world/prj.conf
 +++ b/samples/hello_world/prj.conf
-@@ -1 +1,8 @@
+@@ -1 +1,10 @@
  # nothing here
 +CONFIG_SDHC=y
 +CONFIG_SDHC_BCM2712=y
@@ -659,11 +697,13 @@ index b2a4ba59104..6672451894b 100644
 +CONFIG_SDHC_LOG_LEVEL_DBG=y
 +CONFIG_SD_LOG_LEVEL_DBG=y
 +CONFIG_MAX_XLAT_TABLES=24
++CONFIG_GPIO=y
++
 diff --git a/samples/hello_world/src/main.c b/samples/hello_world/src/main.c
-index c550ab461cb..d6ca37995f4 100644
+index c550ab461cb..4e8910e1b3b 100644
 --- a/samples/hello_world/src/main.c
 +++ b/samples/hello_world/src/main.c
-@@ -6,9 +6,35 @@
+@@ -6,9 +6,118 @@
  
  #include <stdio.h>
  
@@ -673,10 +713,93 @@ index c550ab461cb..d6ca37995f4 100644
 +#include <zephyr/drivers/sdhc.h>
 +#include <zephyr/sd/sd.h>
 +
++#include <zephyr/drivers/gpio.h>
++
 +struct sd_card g_sd_card;
++
++void configure_bcm2712_pinctrl(void)
++{
++	mm_reg_t pinctrl_base;
++	uintptr_t phys_addr = 0x107d504100;
++	size_t size = 0x20;
++
++	device_map(&pinctrl_base, phys_addr, size, K_MEM_CACHE_NONE);
++
++	printk("Mapped BCM2712 pinctrl at 0x%lx\n", (unsigned long)pinctrl_base);
++
++	/* 1. Configure Function Select (Mux) registers for BCM2712 D0:
++	 * Offset 0x08 controls Pin 28, 29, 30, 31:
++	 *   Pin 28: bits 19-16 -> 0 (GPIO)
++	 *   Pin 29: bits 23-20 -> 0 (GPIO)
++	 *   Pin 30: bits 27-24 -> 1 (sd2)
++	 *   Pin 31: bits 31-28 -> 1 (sd2)
++	 *   Value to write: mask out 16-31 and write (1 << 24) | (1 << 28) = 0x11000000
++	 */
++	uint32_t val = sys_read32(pinctrl_base + 0x08);
++	val &= 0x0000FFFF; /* Clear bits 16-31 */
++	val |= 0x11000000; /* Write sd2 to pins 30, 31, GPIO to 28, 29 */
++	sys_write32(val, pinctrl_base + 0x08);
++
++	/* Offset 0x0C controls Pin 32, 33, 34, 35:
++	 *   Pin 32: bits 3-0 -> 1 (sd2)
++	 *   Pin 33: bits 7-4 -> 1 (sd2)
++	 *   Pin 34: bits 11-8 -> 1 (sd2)
++	 *   Pin 35: bits 15-12 -> 1 (sd2)
++	 *   Value to write: mask out 0-15 and write 1 | (1 << 4) | (1 << 8) | (1 << 12) = 0x1111
++	 */
++	val = sys_read32(pinctrl_base + 0x0C);
++	val &= 0xFFFF0000; /* Clear bits 0-15 */
++	val |= 0x1111;     /* Write sd2 to pins 32, 33, 34, 35 */
++	sys_write32(val, pinctrl_base + 0x0C);
++
++	/* 2. Configure Pull (Bias) registers for BCM2712 D0:
++	 * Offset 0x14 controls Pin 28-32 pull-up/pull-down:
++	 *   Pin 28: bits 21-20 -> 0 (None)
++	 *   Pin 29: bits 23-22 -> 0 (None)
++	 *   Pin 30: bits 25-24 -> 0 (None)
++	 *   Pin 31: bits 27-26 -> 2 (Pull-Up) -> 2 << 26 = 0x08000000
++	 *   Pin 32: bits 29-28 -> 2 (Pull-Up) -> 2 << 28 = 0x20000000
++	 *   Value to write: mask out bits 20-31 and write 0x28000000
++	 */
++	val = sys_read32(pinctrl_base + 0x14);
++	val &= ~0xFFF00000; /* Clear bits 20-31 */
++	val |= 0x28000000;  /* Set Pin 31, 32 to Pull-Up (2), Pin 30 to None (0) */
++	sys_write32(val, pinctrl_base + 0x14);
++
++	/* Offset 0x18 controls Pin 33-35 pull-up/pull-down:
++	 *   Pin 33: bits 1-0 -> 2 (Pull-Up) -> 2
++	 *   Pin 34: bits 3-2 -> 2 (Pull-Up) -> 2 << 2 = 8
++	 *   Pin 35: bits 5-4 -> 2 (Pull-Up) -> 2 << 4 = 0x20
++	 *   Value to write: mask out bits 0-5 and write 2 | 8 | 0x20 = 0x2A
++	 */
++	val = sys_read32(pinctrl_base + 0x18);
++	val &= ~0x0000003F; /* Clear bits 0-5 */
++	val |= 0x0000002A;  /* Set Pin 33-35 to Pull-Up (2) */
++	sys_write32(val, pinctrl_base + 0x18);
++
++	printk("BCM2712 SDIO pinctrl registers written successfully!\n");
++
++	device_unmap(pinctrl_base, size);
++}
 +
  int main(void)
  {
++	configure_bcm2712_pinctrl();
++	const struct device *const gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gio));
++
++	if (!device_is_ready(gpio_dev)) {
++		printf("Error: GPIO controller (gio) is not ready!\n");
++	} else {
++		/* Configure GPIO 28 (WL_ON) as output and set it HIGH to power up WiFi */
++		int ret = gpio_pin_configure(gpio_dev, 28, GPIO_OUTPUT_ACTIVE);
++		if (ret < 0) {
++			printf("Error: failed to configure WL_ON (GPIO 28): %d\n", ret);
++		} else {
++			printf("Successfully configured WL_ON (GPIO 28) to HIGH. Waiting 150ms...\n");
++			k_msleep(150);
++		}
++	}
++
 +	/* Get SDHC device */
 +	const struct device *const sdhc_dev = DEVICE_DT_GET(DT_NODELABEL(sdhci1));
 +
@@ -699,3 +822,51 @@ index c550ab461cb..d6ca37995f4 100644
  }
 +
 +
+diff --git a/subsys/sd/sd.c b/subsys/sd/sd.c
+index bc752348ee9..3ef7dbbc7d9 100644
+--- a/subsys/sd/sd.c
++++ b/subsys/sd/sd.c
+@@ -58,7 +58,9 @@ static int sd_send_interface_condition(struct sd_card *card)
+ 	cmd.retries = CONFIG_SD_CMD_RETRIES;
+ 	cmd.timeout_ms = CONFIG_SD_CMD_TIMEOUT;
+ 	ret = sdhc_request(card->sdhc, &cmd, NULL);
+-	if (ret) {
++	if (ret == -ETIMEDOUT) {
++		return -ETIMEDOUT;
++	} else if (ret) {
+ 		LOG_DBG("SD CMD8 failed with error %d", ret);
+ 		/* Retry */
+ 		return SD_RETRY;
+@@ -198,6 +200,19 @@ static int sd_command_init(struct sd_card *card)
+ 	 * Common to SDIO and SDMMC. Some eMMC chips break the
+ 	 * specification and expect something like this too.
+ 	 */
++#ifdef CONFIG_SDIO_STACK
++	/* Reset card with CMD0 */
++	ret = sd_idle(card);
++	if (ret == 0) {
++		/* Attempt to initialize SDIO card first to avoid sending CMD8 to SDIO-only cards */
++		ret = sdio_card_init(card);
++		if (ret == 0) {
++			return 0;
++		}
++		LOG_DBG("SDIO card init failed (%d), falling back to SDMMC", ret);
++	}
++#endif /* CONFIG_SDIO_STACK */
++
+ 	ret = sd_common_init(card);
+ 	if (ret) {
+ 		return ret;
+@@ -212,12 +227,6 @@ static int sd_command_init(struct sd_card *card)
+ 		goto mmc_init;
+ 	}
+ #endif /* CONFIG_MMC_STACK */
+-#ifdef CONFIG_SDIO_STACK
+-	/* Attempt to initialize SDIO card */
+-	if (!sdio_card_init(card)) {
+-		return 0;
+-	}
+-#endif /* CONFIG_SDIO_STACK */
+ #ifdef CONFIG_SDMMC_STACK
+ 	/* Attempt to initialize SDMMC card */
+ 	if (!sdmmc_card_init(card)) {

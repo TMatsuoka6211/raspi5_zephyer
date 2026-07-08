@@ -69,6 +69,23 @@
 			status = "disabled";
 		};
 
+		gpio1: gpio1@107d508500 {
+			compatible = "simple-bus";
+			reg = <0x10 0x7d508500 0x40>;
+
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			gio: gpio@0 {
+				compatible = "brcm,brcmstb-gpio";
+				reg = <0>;
+				gpio-controller;
+				#gpio-cells = <2>;
+				ngpios = <32>;
+				status = "disabled";
+			};
+		};
+
 		gpio2@107d517c00 {
 			compatible = "simple-bus";
 			reg = <0x10 0x7d517c00 0x40>;
