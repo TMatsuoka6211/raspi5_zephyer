@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2012-2014 Wind River Systems, Inc.
+ * Copyright 2026 matsuoka
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 

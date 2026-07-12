@@ -707,16 +707,17 @@ index b2a4ba59104..5305ff780f5 100644
 +CONFIG_SHELL_BACKEND_SERIAL_API_POLLING=y
 \ No newline at end of file
 diff --git a/samples/hello_world/src/main.c b/samples/hello_world/src/main.c
-index c550ab461cb..6afe38b99cd 100644
+index c550ab461cb..b60248958dc 100644
 --- a/samples/hello_world/src/main.c
 +++ b/samples/hello_world/src/main.c
-@@ -1,14 +1,217 @@
--/*
-- * Copyright (c) 2012-2014 Wind River Systems, Inc.
-- *
-- * SPDX-License-Identifier: Apache-2.0
-- */
--
+@@ -1,14 +1,224 @@
+ /*
+  * Copyright (c) 2012-2014 Wind River Systems, Inc.
++ * Copyright 2026 matsuoka
+  *
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
  #include <stdio.h>
 +#include <stdlib.h>
 +
