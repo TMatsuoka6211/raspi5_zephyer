@@ -89,10 +89,16 @@ west build -p always -b rpi_5 samples/hello_world
 - **理由**: ドライバが物理 MMIO 領域を安全にページテーブルにマップするために必要な、仮想変換テーブル領域（バッファテーブル数）を拡張し、枯渇ハングを防止します。
 
 #### 📄 `samples/hello_world/prj.conf` (変更)
-- **変更内容**: SDHC ホストインターフェース (`CONFIG_SDHC=y`) および SD/SDIO カードスタック (`CONFIG_SDIO_STACK=y`) を有効化しました。また、ログレベルを `DBG` に引き上げました。
+- **変更内容**: SDHC ホストインターフェース (`CONFIG_SDHC=y`) および SD/SDIO カードスタック (`CONFIG_SDIO_STACK=y`) の有効化に加え、**Zephyr Shell サブシステム**（`CONFIG_SHELL=y` ほか）を有効化しました。
+- **ポーリング受信モードの適用**: RPi5 の UART 割り込み問題に対応するため、シリアル受信を割り込み駆動ではなく一定周期でレジスタを直接監視するポーリング方式（`CONFIG_SHELL_BACKEND_SERIAL_API_POLLING=y`）で動作させ、シェル入力が常に受け付けられるように調整しました。
 
 #### 📄 `samples/hello_world/src/main.c` (変更)
 - **変更内容**: 
-  - **BCM2712 D0 ピン多重化（Pin Muxing）の修正**: SDIOピン（GPIO 30-35）のFunction Selectレジスタに書き込むMux値を、D0ステッピングの仕様に合わせて **`1` (sd2)** に設定しました。また、内部プルアップ/プルダウンの設定を適切に適用しました。
-  - **WiFiチップ起動制御**: GPIO 28（WL_ON）を出力設定し HIGH に駆動してWiFi電源をONにし、物理的な起動安定化のため 150ms のウェイトを挿入。
-  - **検証ロジックの追加**: `sdhci1` デバイスがレディ状態になったのち、Zephyr 標準の SD カードスタック初期化 API `sd_init()` を呼び出して、通信相手（CYW43455）の検出を開始し、カード種別やステータスをコンソールに出力する検証ロジックを実装。
+  - **BCM2712 D0 ピン多重化（Pin Muxing）の修正**: SDIOピン（GPIO 30-35）のMux値を D0 ステッピング用の **`1` (sd2)** に設定し、適切なプルアップ設定を適用しました。
+  - **WiFiチップ起動制御と自動リセット**: コントローラの初期化（`sd_init`）時に発生するホスト側電源リセットと同期してWiFiチップも綺麗に再起動するよう、`WL_ON`（GPIO 28）を一度LOWに落としてからHIGHに戻す自動パワーサイクルロジックを統合しました。
+  - **対話型 `sdio` シェルコマンドの登録**: 以下のサブコマンドを登録し、シリアルコンソールから動的に呼び出せるようにしました。
+    - `sdio pinctrl` (ピン多重化の設定)
+    - `sdio power <on/off>` (WL_ON GPIOの手動制御)
+    - `sdio init` (WiFi電源制御＆D0ピン設定を実行後の、SDIOスタック初期化)
+    - `sdio read <func> <addr>` (CMD52による1バイトレジスタ読み込み)
+    - `sdio write <func> <addr> <val>` (CMD52による1バイトレジスタ書き込み)
