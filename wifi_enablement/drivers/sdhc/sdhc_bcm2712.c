@@ -10,6 +10,7 @@
 #include <zephyr/drivers/sdhc.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/sys_io.h>
+#include <zephyr/sys/device_mmio.h>
 
 LOG_MODULE_REGISTER(sdhc_bcm2712, CONFIG_SDHC_LOG_LEVEL);
 
@@ -79,6 +80,9 @@ static int sdhc_bcm2712_reset_internal(const struct device *dev)
 	sys_write32(0xFFFFFFFF, DEVICE_MMIO_GET(dev) + SDHCI_INT_ENABLE);
 	sys_write32(0xFFFFFFFF, DEVICE_MMIO_GET(dev) + SDHCI_SIGNAL_ENABLE);
 
+	/* Set Data Timeout Control to maximum (0x0E = 2^27 TMCLK cycles) */
+	sys_write8(0x0E, DEVICE_MMIO_GET(dev) + SDHCI_TIMEOUT_CONTROL);
+
 	LOG_DBG("SDHCI reset complete and interrupts enabled");
 	return 0;
 }
@@ -106,6 +110,12 @@ static void sdhc_bcm2712_recover_error(const struct device *dev, uint32_t int_st
 	}
 	if (int_status & (0xF0 << 16)) { /* Data errors: bits 23-20 */
 		reset_bit |= 0x04; /* Reset DAT line (SDHCI_RESET_DATA) */
+	}
+
+
+	/* If no specific error bit matched (e.g. timeout fallback), reset both CMD and DAT lines */
+	if (reset_bit == 0) {
+		reset_bit = 0x06;
 	}
 
 	if (reset_bit) {
@@ -146,22 +156,29 @@ static int sdhc_bcm2712_request(const struct device *dev,
 
 	resp_type = cmd->response_type & SDHC_NATIVE_RESPONSE_MASK;
 
-	LOG_DBG("Sending CMD opcode: %d, arg: 0x%x, resp_type: %d", 
-		cmd->opcode, cmd->arg, resp_type);
-
-	/* 1. Wait for Command Inhibit (CMD) to clear */
-	while (sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE) & BIT(0)) {
+	/* 1. Wait for Command Inhibit (CMD and DAT) and DAT Line Active to clear */
+	while (sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE) & (BIT(0) | BIT(1) | BIT(2))) {
 		k_busy_wait(10);
 		if (--timeout == 0) {
-			LOG_ERR("Command inhibit timeout");
-			return -EBUSY;
+			/* If DAT line is stuck busy, issue software reset for CMD & DAT to unblock */
+			sys_write8(0x06, DEVICE_MMIO_GET(dev) + SDHCI_SOFTWARE_RESET);
+			int r_timeout = 1000;
+			while ((sys_read8(DEVICE_MMIO_GET(dev) + SDHCI_SOFTWARE_RESET) & 0x06) && --r_timeout) {
+				k_busy_wait(10);
+			}
+			uint32_t state = sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE);
+			if (state & (BIT(0) | BIT(1) | BIT(2))) {
+				printf("SDHC: Command inhibit timeout (CMD%d arg 0x%x PRESENT_STATE: 0x%x)\n",
+					cmd->opcode, cmd->arg, state);
+				fflush(stdout);
+				LOG_ERR("Command inhibit timeout");
+				return -EBUSY;
+			}
+			break;
 		}
 	}
 
-	/* 2. Write argument */
-	sdhc_bcm2712_write(dev, cmd->arg, SDHCI_ARGUMENT);
-
-	/* 3. Setup command register bits */
+	/* 2. Setup command register bits */
 	cmd_reg |= (cmd->opcode & 0x3f) << 8; /* Command index */
 
 	/* Set response type bits based on native response type */
@@ -197,24 +214,60 @@ static int sdhc_bcm2712_request(const struct device *dev,
 		return -EINVAL;
 	}
 
+	bool is_read = false;
+	uint16_t transfer_mode = 0;
+
 	if (data != NULL) {
 		cmd_reg |= BIT(5); /* Data present */
-		/* TODO: Setup transfer mode and DMA if data transfer is required */
+
+		/* Determine data transfer direction:
+		 * For CMD53 (SDIO), bit 31 of argument is R/W flag (1: write, 0: read).
+		 * For standard SD read commands: CMD17, CMD18.
+		 */
+		if (cmd->opcode == 53) {
+			is_read = ((cmd->arg & BIT(31)) == 0);
+		} else if (cmd->opcode == 17 || cmd->opcode == 18) {
+			is_read = true;
+		}
+
+		/* 1. Setup Block Size and Block Count */
+		sys_write16(data->block_size, DEVICE_MMIO_GET(dev) + SDHCI_BLOCK_SIZE);
+		sys_write16(data->blocks, DEVICE_MMIO_GET(dev) + SDHCI_BLOCK_COUNT);
+
+		/* 2. Setup Transfer Mode */
+		if (is_read) {
+			transfer_mode |= BIT(4); /* Data Transfer Direction: Read (1) */
+		}
+		/* Enable Block Count for all data transfers (Single-block, multi-block, and SDIO byte mode) */
+		transfer_mode |= BIT(1); /* Block Count Enable */
+		if (data->blocks > 1) {
+			transfer_mode |= BIT(5); /* Multi-block */
+		}
+		/* Set Data Timeout Control to maximum (0x0E) */
+		sys_write8(0x0E, DEVICE_MMIO_GET(dev) + SDHCI_TIMEOUT_CONTROL);
 	}
 
-	/* 4. Clear interrupt status for command complete and errors */
-	sdhc_bcm2712_write(dev, 0xFFFF, SDHCI_INT_STATUS);
+	/* 3. Clear all normal and error interrupt status */
+	sdhc_bcm2712_write(dev, 0xFFFFFFFF, SDHCI_INT_STATUS);
 
-	/* 5. Issue the command */
-	sys_write16(cmd_reg, DEVICE_MMIO_GET(dev) + SDHCI_COMMAND);
+	/* 4. Write argument */
+	sdhc_bcm2712_write(dev, cmd->arg, SDHCI_ARGUMENT);
+
+	/* 5. Issue Command & Transfer Mode as combined 32-bit register */
+	uint32_t cmd_and_mode = (cmd_reg << 16) | transfer_mode;
+	sdhc_bcm2712_write(dev, cmd_and_mode, SDHCI_TRANSFER_MODE);
 
 	/* 6. Wait for Command Complete (or error) */
 	timeout = 20000;
 	while (1) {
 		int_status = sdhc_bcm2712_read(dev, SDHCI_INT_STATUS);
-		if (int_status & 0xFFFF0000) {
-			uint32_t err_status = int_status >> 16;
+		uint32_t err_mask = 0x000F0000; /* Only check Command Errors (bits 16-19: CMD Timeout/CRC/EndBit/Index) */
+		if (int_status & err_mask) {
+			uint32_t err_status = (int_status & err_mask) >> 16;
 			/* Error occurred - check this FIRST */
+			printf("SDHC: Command error: 0x%x (CMD%d arg 0x%x, INT_STATUS=0x%x, PRESENT_STATE=0x%x)\n",
+			       err_status, cmd->opcode, cmd->arg, int_status, sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE));
+			fflush(stdout);
 			LOG_ERR("Command error: 0x%x (CMD%d)", err_status, cmd->opcode);
 			/* Clear interrupt */
 			sdhc_bcm2712_write(dev, int_status, SDHCI_INT_STATUS);
@@ -232,6 +285,9 @@ static int sdhc_bcm2712_request(const struct device *dev,
 		k_busy_wait(10);
 		if (--timeout == 0) {
 			uint32_t state = sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE);
+			printf("SDHC: Command complete timeout. INT_STATUS: 0x%x, PRESENT_STATE: 0x%x\n", 
+				int_status, state);
+			fflush(stdout);
 			LOG_ERR("Command complete timeout. INT_STATUS: 0x%x, PRESENT_STATE: 0x%x", 
 				int_status, state);
 			/* Perform error recovery reset to unblock the command engine */
@@ -255,6 +311,141 @@ static int sdhc_bcm2712_request(const struct device *dev,
 			/* Short response: read RESP0 */
 			cmd->response[0] = sdhc_bcm2712_read(dev, SDHCI_RESPONSE);
 		}
+	}
+
+	/* 9. Handle Data Transfer (PIO via Buffer Data Port 0x20) */
+	if (data != NULL) {
+		uint8_t *buf = (uint8_t *)data->data;
+		uint32_t bytes_done = 0;
+
+		for (uint32_t b = 0; b < data->blocks; b++) {
+			uint32_t block_bytes = data->block_size;
+			uint32_t words = (block_bytes + 3) / 4;
+
+			if (is_read) {
+				/* Wait for Buffer Read Ready (BIT 5 in INT_STATUS) or Transfer Complete (BIT 1) */
+				timeout = 20000;
+				while (1) {
+					uint32_t status = sdhc_bcm2712_read(dev, SDHCI_INT_STATUS);
+					if (status & (BIT(5) | BIT(1))) {
+						sdhc_bcm2712_write(dev, BIT(5) | BIT(1), SDHCI_INT_STATUS);
+						break;
+					}
+					if (b == 0 && (sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE) & BIT(11))) {
+						sdhc_bcm2712_write(dev, BIT(5), SDHCI_INT_STATUS);
+						break;
+					}
+					if (status & 0xFFFF0000) {
+						printf("SDHC: Data read error: 0x%x (CMD%d arg 0x%x, INT:0x%x STATE:0x%x)\n",
+						       status >> 16, cmd->opcode, cmd->arg, status, sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE));
+						fflush(stdout);
+						LOG_ERR("Data read error: 0x%x", status >> 16);
+						sdhc_bcm2712_write(dev, status, SDHCI_INT_STATUS);
+						sdhc_bcm2712_recover_error(dev, status);
+						return -EIO;
+					}
+					k_busy_wait(10);
+					if (--timeout == 0) {
+						uint32_t state = sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE);
+						printf("SDHC: Buffer Read Ready timeout (CMD%d arg 0x%x INT:0x%x STATE:0x%x)\n",
+							cmd->opcode, cmd->arg, status, state);
+						fflush(stdout);
+						LOG_ERR("Buffer Read Ready timeout (CMD%d arg 0x%x INT:0x%x STATE:0x%x)",
+							cmd->opcode, cmd->arg, status, state);
+						sdhc_bcm2712_recover_error(dev, status ? status : 0x00200000);
+						return -ETIMEDOUT;
+					}
+				}
+
+				/* Read words from SDHCI_BUFFER_DATA_PORT */
+				for (uint32_t w = 0; w < words; w++) {
+					uint32_t val = sys_read32(DEVICE_MMIO_GET(dev) + SDHCI_BUFFER_DATA_PORT);
+					uint32_t rem = block_bytes - (w * 4);
+					uint32_t chunk = (rem < 4) ? rem : 4;
+					memcpy(buf + bytes_done, &val, chunk);
+					bytes_done += chunk;
+				}
+			} else {
+				/* Wait for Buffer Write Ready (BIT 4 in INT_STATUS) or Buffer Write Enable (BIT 10 in PRESENT_STATE for block 0) */
+				timeout = 20000;
+				while (1) {
+					uint32_t status = sdhc_bcm2712_read(dev, SDHCI_INT_STATUS);
+					if (status & BIT(4)) {
+						sdhc_bcm2712_write(dev, BIT(4), SDHCI_INT_STATUS);
+						break;
+					}
+					if (b == 0 && (sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE) & BIT(10))) {
+						sdhc_bcm2712_write(dev, BIT(4), SDHCI_INT_STATUS);
+						break;
+					}
+					if (status & 0xFFFF0000) {
+						printf("SDHC: Data write error: 0x%x (CMD%d arg 0x%x, INT:0x%x STATE:0x%x)\n",
+						       status >> 16, cmd->opcode, cmd->arg, status, sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE));
+						fflush(stdout);
+						LOG_ERR("Data write error: 0x%x", status >> 16);
+						sdhc_bcm2712_write(dev, status, SDHCI_INT_STATUS);
+						sdhc_bcm2712_recover_error(dev, status);
+						return -EIO;
+					}
+					k_busy_wait(10);
+					if (--timeout == 0) {
+						uint32_t state = sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE);
+						printf("SDHC: Buffer Write Ready timeout (CMD%d arg 0x%x blk:%d/%d INT:0x%x STATE:0x%x)\n",
+							cmd->opcode, cmd->arg, b, data->blocks, status, state);
+						fflush(stdout);
+						LOG_ERR("Buffer Write Ready timeout (CMD%d arg 0x%x blk:%d/%d INT:0x%x STATE:0x%x)",
+							cmd->opcode, cmd->arg, b, data->blocks, status, state);
+						return -ETIMEDOUT;
+					}
+				}
+
+				/* Write words to SDHCI_BUFFER_DATA_PORT */
+				for (uint32_t w = 0; w < words; w++) {
+					uint32_t val = 0;
+					uint32_t rem = block_bytes - (w * 4);
+					uint32_t chunk = (rem < 4) ? rem : 4;
+					memcpy(&val, buf + bytes_done, chunk);
+					sys_write32(val, DEVICE_MMIO_GET(dev) + SDHCI_BUFFER_DATA_PORT);
+					bytes_done += chunk;
+				}
+			}
+		}
+
+		/* Wait for Transfer Complete (BIT 1 in INT_STATUS) or all DAT active/inhibit bits to clear */
+		timeout = 20000;
+		while (1) {
+			uint32_t status = sdhc_bcm2712_read(dev, SDHCI_INT_STATUS);
+			if (status & BIT(1)) {
+				/* Clear Transfer Complete */
+				sdhc_bcm2712_write(dev, BIT(1) | BIT(4) | BIT(5), SDHCI_INT_STATUS);
+				break;
+			}
+			if (status & 0xFFFF0000) {
+				printf("SDHC: Data transfer error: 0x%x (CMD%d arg 0x%x, INT:0x%x STATE:0x%x)\n",
+					status >> 16, cmd->opcode, cmd->arg, status, sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE));
+				fflush(stdout);
+				sdhc_bcm2712_write(dev, status, SDHCI_INT_STATUS);
+				sdhc_bcm2712_recover_error(dev, status);
+				return -EIO;
+			}
+			uint32_t state = sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE);
+			/* Check Command Inhibit DAT (BIT 1), DAT Line Active (BIT 2), Write Active (BIT 8), Read Active (BIT 9) are all 0, and DAT0 (BIT 20) is HIGH */
+			if ((state & (BIT(1) | BIT(2) | BIT(8) | BIT(9))) == 0 && (state & BIT(20)) != 0) {
+				sdhc_bcm2712_write(dev, BIT(1) | BIT(4) | BIT(5), SDHCI_INT_STATUS);
+				break;
+			}
+			k_busy_wait(5);
+			if (--timeout == 0) {
+				printf("SDHC: Transfer Complete timeout (CMD%d arg 0x%x read:%d blks:%d sz:%d done:%d INT:0x%x STATE:0x%x)\n",
+					cmd->opcode, cmd->arg, is_read, data->blocks, data->block_size,
+					bytes_done, status, state);
+				fflush(stdout);
+				/* Perform error recovery reset to unblock the data engine (0x00100000 = Data Timeout) */
+				sdhc_bcm2712_recover_error(dev, 0x00100000);
+				return -ETIMEDOUT;
+			}
+		}
+		data->bytes_xfered = bytes_done;
 	}
 
 	/* Wait for the card to stabilize its internal state machine after CMD0 */
@@ -288,11 +479,11 @@ static int sdhc_bcm2712_set_clk(const struct device *dev, uint32_t hz)
 	/* Do not set SDIO_CFG_SD_PIN_SEL_SD for non-removable SDIO */
 	sys_write32(pin_sel, DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 
-	/* Get base clock from Capabilities register */
+	/* Get base clock (BCM2712 SDIO base clock is 200MHz) */
 	caps = sys_read32(DEVICE_MMIO_GET(dev) + SDHCI_CAPABILITIES);
 	base_clk = ((caps >> 8) & 0xFF) * 1000000;
-	if (base_clk == 0) {
-		base_clk = 100000000; /* Fallback to 100MHz */
+	if (base_clk == 0 || base_clk < 200000000) {
+		base_clk = 200000000; /* BCM2712 SDIO base clock is 200MHz */
 	}
 
 	/* Calculate divisor */
@@ -462,7 +653,7 @@ static int sdhc_bcm2712_get_host_props(const struct device *dev,
 
 	memset(props, 0, sizeof(struct sdhc_host_props));
 	props->f_min = SDMMC_CLOCK_400KHZ;
-	props->f_max = SD_CLOCK_25MHZ;
+	props->f_max = 12500000; /* Test with 12.5MHz for robust SDIO signal timing */
 	props->power_delay = config->power_delay_ms;
 	props->host_caps.vol_180_support = true;
 	props->host_caps.vol_330_support = false;
@@ -491,9 +682,61 @@ static int sdhc_bcm2712_card_busy(const struct device *dev)
 	return 0;
 }
 
+static void bcm2712_configure_pinctrl(void)
+{
+	mm_reg_t pinctrl_base;
+	uintptr_t phys_addr = 0x107d504100;
+	size_t size = 0x20;
+
+	device_map(&pinctrl_base, phys_addr, size, K_MEM_CACHE_NONE);
+
+	printk("Mapped BCM2712 pinctrl at 0x%lx\n", (unsigned long)pinctrl_base);
+
+	/* 1. Configure Function Select (Mux) registers for BCM2712 D0:
+	 * Offset 0x08 controls Pin 28, 29, 30, 31:
+	 *   Pin 28: bits 19-16 -> 0 (GPIO)
+	 *   Pin 29: bits 23-20 -> 0 (GPIO)
+	 *   Pin 30: bits 27-24 -> 1 (sd2)
+	 *   Pin 31: bits 31-28 -> 1 (sd2)
+	 */
+	uint32_t val = sys_read32(pinctrl_base + 0x08);
+	val &= 0x0000FFFF;
+	val |= 0x11000000;
+	sys_write32(val, pinctrl_base + 0x08);
+
+	/* Offset 0x0C controls Pin 32, 33, 34, 35:
+	 *   Pin 32-35: bits 15-0 -> 1 (sd2)
+	 */
+	val = sys_read32(pinctrl_base + 0x0C);
+	val &= 0xFFFF0000;
+	val |= 0x1111;
+	sys_write32(val, pinctrl_base + 0x0C);
+
+	/* 2. Configure Pull (Bias) registers for BCM2712 D0:
+	 * Offset 0x14 controls Pin 28-32 pull-up/pull-down:
+	 *   Pin 31, 32 -> 2 (Pull-Up), Pin 30 (CLK) -> 0 (None)
+	 */
+	val = sys_read32(pinctrl_base + 0x14);
+	val &= 0x000FFFFF;
+	val |= 0x28000000;
+	sys_write32(val, pinctrl_base + 0x14);
+
+	/* Offset 0x18 controls Pin 33-35 pull-up/pull-down:
+	 *   Pin 33-35 -> 2 (Pull-Up)
+	 */
+	val = sys_read32(pinctrl_base + 0x18);
+	val &= 0xFFFFFFC0;
+	val |= 0x2A;
+	sys_write32(val, pinctrl_base + 0x18);
+
+	printk("BCM2712 SDIO pinctrl configured successfully in SDHC driver init!\n");
+}
+
 static int sdhc_bcm2712_init(const struct device *dev)
 {
 	uint32_t pin_sel;
+
+	bcm2712_configure_pinctrl();
 
 	DEVICE_MMIO_MAP(dev, K_MEM_CACHE_NONE);
 
@@ -503,6 +746,9 @@ static int sdhc_bcm2712_init(const struct device *dev)
 	/* Log the initial value of SDIO_CFG_SD_PIN_SEL register */
 	pin_sel = sys_read32(DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 	printk("Initial SDIO_CFG_SD_PIN_SEL: 0x%x\n", pin_sel);
+
+	/* Ensure SDIO_CFG_SD_PIN_SEL is set to 1 for slot 1 */
+	sys_write32(0x1, DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 
 	return sdhc_bcm2712_reset_internal(dev);
 }

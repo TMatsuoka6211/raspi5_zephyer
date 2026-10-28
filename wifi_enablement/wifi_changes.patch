@@ -1,22 +1,27 @@
 diff --git a/boards/raspberrypi/rpi_5/rpi_5_bcm2712.dts b/boards/raspberrypi/rpi_5/rpi_5_bcm2712.dts
-index 339adba011c..56683a42235 100644
+index 339adba011c..0f99f3ea0f4 100644
 --- a/boards/raspberrypi/rpi_5/rpi_5_bcm2712.dts
 +++ b/boards/raspberrypi/rpi_5/rpi_5_bcm2712.dts
-@@ -49,3 +49,16 @@
+@@ -49,3 +49,21 @@
  &gpio0_0 {
  	status = "okay";
  };
 +
 +&sdhci1 {
 +	status = "okay";
-+	wifi: cyw43455@1 {
-+		compatible = "infineon,cyw43455-sdio";
-+		reg = <1>;
++	airoc_wifi: airoc-wifi {
++		compatible = "infineon,airoc-wifi";
++		status = "okay";
++		wifi-reg-on-gpios = <&gio 28 GPIO_ACTIVE_HIGH>;
 +	};
 +};
 +
 +&gio {
 +	status = "okay";
++};
++
++&sram0 {
++	reg = <0x0 0x200000 0x1000000>; /* 16MB RAM region */
 +};
 +
 diff --git a/boards/raspberrypi/rpi_5/rpi_5_bcm2712_defconfig b/boards/raspberrypi/rpi_5/rpi_5_bcm2712_defconfig
@@ -71,10 +76,10 @@ index 00000000000..90567ec8df7
 +	  Enable the Broadcom BCM2712 SDHCI controller driver.
 diff --git a/drivers/sdhc/sdhc_bcm2712.c b/drivers/sdhc/sdhc_bcm2712.c
 new file mode 100644
-index 00000000000..6c5106c9285
+index 00000000000..93fccfdf734
 --- /dev/null
 +++ b/drivers/sdhc/sdhc_bcm2712.c
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,782 @@
 +/*
 + * Copyright 2026 matsuoka
 + *
@@ -87,6 +92,7 @@ index 00000000000..6c5106c9285
 +#include <zephyr/drivers/sdhc.h>
 +#include <zephyr/logging/log.h>
 +#include <zephyr/sys/sys_io.h>
++#include <zephyr/sys/device_mmio.h>
 +
 +LOG_MODULE_REGISTER(sdhc_bcm2712, CONFIG_SDHC_LOG_LEVEL);
 +
@@ -156,6 +162,9 @@ index 00000000000..6c5106c9285
 +	sys_write32(0xFFFFFFFF, DEVICE_MMIO_GET(dev) + SDHCI_INT_ENABLE);
 +	sys_write32(0xFFFFFFFF, DEVICE_MMIO_GET(dev) + SDHCI_SIGNAL_ENABLE);
 +
++	/* Set Data Timeout Control to maximum (0x0E = 2^27 TMCLK cycles) */
++	sys_write8(0x0E, DEVICE_MMIO_GET(dev) + SDHCI_TIMEOUT_CONTROL);
++
 +	LOG_DBG("SDHCI reset complete and interrupts enabled");
 +	return 0;
 +}
@@ -183,6 +192,12 @@ index 00000000000..6c5106c9285
 +	}
 +	if (int_status & (0xF0 << 16)) { /* Data errors: bits 23-20 */
 +		reset_bit |= 0x04; /* Reset DAT line (SDHCI_RESET_DATA) */
++	}
++
++
++	/* If no specific error bit matched (e.g. timeout fallback), reset both CMD and DAT lines */
++	if (reset_bit == 0) {
++		reset_bit = 0x06;
 +	}
 +
 +	if (reset_bit) {
@@ -223,22 +238,29 @@ index 00000000000..6c5106c9285
 +
 +	resp_type = cmd->response_type & SDHC_NATIVE_RESPONSE_MASK;
 +
-+	LOG_DBG("Sending CMD opcode: %d, arg: 0x%x, resp_type: %d", 
-+		cmd->opcode, cmd->arg, resp_type);
-+
-+	/* 1. Wait for Command Inhibit (CMD) to clear */
-+	while (sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE) & BIT(0)) {
++	/* 1. Wait for Command Inhibit (CMD and DAT) and DAT Line Active to clear */
++	while (sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE) & (BIT(0) | BIT(1) | BIT(2))) {
 +		k_busy_wait(10);
 +		if (--timeout == 0) {
-+			LOG_ERR("Command inhibit timeout");
-+			return -EBUSY;
++			/* If DAT line is stuck busy, issue software reset for CMD & DAT to unblock */
++			sys_write8(0x06, DEVICE_MMIO_GET(dev) + SDHCI_SOFTWARE_RESET);
++			int r_timeout = 1000;
++			while ((sys_read8(DEVICE_MMIO_GET(dev) + SDHCI_SOFTWARE_RESET) & 0x06) && --r_timeout) {
++				k_busy_wait(10);
++			}
++			uint32_t state = sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE);
++			if (state & (BIT(0) | BIT(1) | BIT(2))) {
++				printf("SDHC: Command inhibit timeout (CMD%d arg 0x%x PRESENT_STATE: 0x%x)\n",
++					cmd->opcode, cmd->arg, state);
++				fflush(stdout);
++				LOG_ERR("Command inhibit timeout");
++				return -EBUSY;
++			}
++			break;
 +		}
 +	}
 +
-+	/* 2. Write argument */
-+	sdhc_bcm2712_write(dev, cmd->arg, SDHCI_ARGUMENT);
-+
-+	/* 3. Setup command register bits */
++	/* 2. Setup command register bits */
 +	cmd_reg |= (cmd->opcode & 0x3f) << 8; /* Command index */
 +
 +	/* Set response type bits based on native response type */
@@ -274,24 +296,60 @@ index 00000000000..6c5106c9285
 +		return -EINVAL;
 +	}
 +
++	bool is_read = false;
++	uint16_t transfer_mode = 0;
++
 +	if (data != NULL) {
 +		cmd_reg |= BIT(5); /* Data present */
-+		/* TODO: Setup transfer mode and DMA if data transfer is required */
++
++		/* Determine data transfer direction:
++		 * For CMD53 (SDIO), bit 31 of argument is R/W flag (1: write, 0: read).
++		 * For standard SD read commands: CMD17, CMD18.
++		 */
++		if (cmd->opcode == 53) {
++			is_read = ((cmd->arg & BIT(31)) == 0);
++		} else if (cmd->opcode == 17 || cmd->opcode == 18) {
++			is_read = true;
++		}
++
++		/* 1. Setup Block Size and Block Count */
++		sys_write16(data->block_size, DEVICE_MMIO_GET(dev) + SDHCI_BLOCK_SIZE);
++		sys_write16(data->blocks, DEVICE_MMIO_GET(dev) + SDHCI_BLOCK_COUNT);
++
++		/* 2. Setup Transfer Mode */
++		if (is_read) {
++			transfer_mode |= BIT(4); /* Data Transfer Direction: Read (1) */
++		}
++		/* Enable Block Count for all data transfers (Single-block, multi-block, and SDIO byte mode) */
++		transfer_mode |= BIT(1); /* Block Count Enable */
++		if (data->blocks > 1) {
++			transfer_mode |= BIT(5); /* Multi-block */
++		}
++		/* Set Data Timeout Control to maximum (0x0E) */
++		sys_write8(0x0E, DEVICE_MMIO_GET(dev) + SDHCI_TIMEOUT_CONTROL);
 +	}
 +
-+	/* 4. Clear interrupt status for command complete and errors */
-+	sdhc_bcm2712_write(dev, 0xFFFF, SDHCI_INT_STATUS);
++	/* 3. Clear all normal and error interrupt status */
++	sdhc_bcm2712_write(dev, 0xFFFFFFFF, SDHCI_INT_STATUS);
 +
-+	/* 5. Issue the command */
-+	sys_write16(cmd_reg, DEVICE_MMIO_GET(dev) + SDHCI_COMMAND);
++	/* 4. Write argument */
++	sdhc_bcm2712_write(dev, cmd->arg, SDHCI_ARGUMENT);
++
++	/* 5. Issue Command & Transfer Mode as combined 32-bit register */
++	uint32_t cmd_and_mode = (cmd_reg << 16) | transfer_mode;
++	sdhc_bcm2712_write(dev, cmd_and_mode, SDHCI_TRANSFER_MODE);
 +
 +	/* 6. Wait for Command Complete (or error) */
 +	timeout = 20000;
 +	while (1) {
 +		int_status = sdhc_bcm2712_read(dev, SDHCI_INT_STATUS);
-+		if (int_status & 0xFFFF0000) {
-+			uint32_t err_status = int_status >> 16;
++		uint32_t err_mask = 0x000F0000; /* Only check Command Errors (bits 16-19: CMD Timeout/CRC/EndBit/Index) */
++		if (int_status & err_mask) {
++			uint32_t err_status = (int_status & err_mask) >> 16;
 +			/* Error occurred - check this FIRST */
++			printf("SDHC: Command error: 0x%x (CMD%d arg 0x%x, INT_STATUS=0x%x, PRESENT_STATE=0x%x)\n",
++			       err_status, cmd->opcode, cmd->arg, int_status, sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE));
++			fflush(stdout);
 +			LOG_ERR("Command error: 0x%x (CMD%d)", err_status, cmd->opcode);
 +			/* Clear interrupt */
 +			sdhc_bcm2712_write(dev, int_status, SDHCI_INT_STATUS);
@@ -309,6 +367,9 @@ index 00000000000..6c5106c9285
 +		k_busy_wait(10);
 +		if (--timeout == 0) {
 +			uint32_t state = sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE);
++			printf("SDHC: Command complete timeout. INT_STATUS: 0x%x, PRESENT_STATE: 0x%x\n", 
++				int_status, state);
++			fflush(stdout);
 +			LOG_ERR("Command complete timeout. INT_STATUS: 0x%x, PRESENT_STATE: 0x%x", 
 +				int_status, state);
 +			/* Perform error recovery reset to unblock the command engine */
@@ -332,6 +393,141 @@ index 00000000000..6c5106c9285
 +			/* Short response: read RESP0 */
 +			cmd->response[0] = sdhc_bcm2712_read(dev, SDHCI_RESPONSE);
 +		}
++	}
++
++	/* 9. Handle Data Transfer (PIO via Buffer Data Port 0x20) */
++	if (data != NULL) {
++		uint8_t *buf = (uint8_t *)data->data;
++		uint32_t bytes_done = 0;
++
++		for (uint32_t b = 0; b < data->blocks; b++) {
++			uint32_t block_bytes = data->block_size;
++			uint32_t words = (block_bytes + 3) / 4;
++
++			if (is_read) {
++				/* Wait for Buffer Read Ready (BIT 5 in INT_STATUS) or Transfer Complete (BIT 1) */
++				timeout = 20000;
++				while (1) {
++					uint32_t status = sdhc_bcm2712_read(dev, SDHCI_INT_STATUS);
++					if (status & (BIT(5) | BIT(1))) {
++						sdhc_bcm2712_write(dev, BIT(5) | BIT(1), SDHCI_INT_STATUS);
++						break;
++					}
++					if (b == 0 && (sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE) & BIT(11))) {
++						sdhc_bcm2712_write(dev, BIT(5), SDHCI_INT_STATUS);
++						break;
++					}
++					if (status & 0xFFFF0000) {
++						printf("SDHC: Data read error: 0x%x (CMD%d arg 0x%x, INT:0x%x STATE:0x%x)\n",
++						       status >> 16, cmd->opcode, cmd->arg, status, sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE));
++						fflush(stdout);
++						LOG_ERR("Data read error: 0x%x", status >> 16);
++						sdhc_bcm2712_write(dev, status, SDHCI_INT_STATUS);
++						sdhc_bcm2712_recover_error(dev, status);
++						return -EIO;
++					}
++					k_busy_wait(10);
++					if (--timeout == 0) {
++						uint32_t state = sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE);
++						printf("SDHC: Buffer Read Ready timeout (CMD%d arg 0x%x INT:0x%x STATE:0x%x)\n",
++							cmd->opcode, cmd->arg, status, state);
++						fflush(stdout);
++						LOG_ERR("Buffer Read Ready timeout (CMD%d arg 0x%x INT:0x%x STATE:0x%x)",
++							cmd->opcode, cmd->arg, status, state);
++						sdhc_bcm2712_recover_error(dev, status ? status : 0x00200000);
++						return -ETIMEDOUT;
++					}
++				}
++
++				/* Read words from SDHCI_BUFFER_DATA_PORT */
++				for (uint32_t w = 0; w < words; w++) {
++					uint32_t val = sys_read32(DEVICE_MMIO_GET(dev) + SDHCI_BUFFER_DATA_PORT);
++					uint32_t rem = block_bytes - (w * 4);
++					uint32_t chunk = (rem < 4) ? rem : 4;
++					memcpy(buf + bytes_done, &val, chunk);
++					bytes_done += chunk;
++				}
++			} else {
++				/* Wait for Buffer Write Ready (BIT 4 in INT_STATUS) or Buffer Write Enable (BIT 10 in PRESENT_STATE for block 0) */
++				timeout = 20000;
++				while (1) {
++					uint32_t status = sdhc_bcm2712_read(dev, SDHCI_INT_STATUS);
++					if (status & BIT(4)) {
++						sdhc_bcm2712_write(dev, BIT(4), SDHCI_INT_STATUS);
++						break;
++					}
++					if (b == 0 && (sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE) & BIT(10))) {
++						sdhc_bcm2712_write(dev, BIT(4), SDHCI_INT_STATUS);
++						break;
++					}
++					if (status & 0xFFFF0000) {
++						printf("SDHC: Data write error: 0x%x (CMD%d arg 0x%x, INT:0x%x STATE:0x%x)\n",
++						       status >> 16, cmd->opcode, cmd->arg, status, sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE));
++						fflush(stdout);
++						LOG_ERR("Data write error: 0x%x", status >> 16);
++						sdhc_bcm2712_write(dev, status, SDHCI_INT_STATUS);
++						sdhc_bcm2712_recover_error(dev, status);
++						return -EIO;
++					}
++					k_busy_wait(10);
++					if (--timeout == 0) {
++						uint32_t state = sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE);
++						printf("SDHC: Buffer Write Ready timeout (CMD%d arg 0x%x blk:%d/%d INT:0x%x STATE:0x%x)\n",
++							cmd->opcode, cmd->arg, b, data->blocks, status, state);
++						fflush(stdout);
++						LOG_ERR("Buffer Write Ready timeout (CMD%d arg 0x%x blk:%d/%d INT:0x%x STATE:0x%x)",
++							cmd->opcode, cmd->arg, b, data->blocks, status, state);
++						return -ETIMEDOUT;
++					}
++				}
++
++				/* Write words to SDHCI_BUFFER_DATA_PORT */
++				for (uint32_t w = 0; w < words; w++) {
++					uint32_t val = 0;
++					uint32_t rem = block_bytes - (w * 4);
++					uint32_t chunk = (rem < 4) ? rem : 4;
++					memcpy(&val, buf + bytes_done, chunk);
++					sys_write32(val, DEVICE_MMIO_GET(dev) + SDHCI_BUFFER_DATA_PORT);
++					bytes_done += chunk;
++				}
++			}
++		}
++
++		/* Wait for Transfer Complete (BIT 1 in INT_STATUS) or all DAT active/inhibit bits to clear */
++		timeout = 20000;
++		while (1) {
++			uint32_t status = sdhc_bcm2712_read(dev, SDHCI_INT_STATUS);
++			if (status & BIT(1)) {
++				/* Clear Transfer Complete */
++				sdhc_bcm2712_write(dev, BIT(1) | BIT(4) | BIT(5), SDHCI_INT_STATUS);
++				break;
++			}
++			if (status & 0xFFFF0000) {
++				printf("SDHC: Data transfer error: 0x%x (CMD%d arg 0x%x, INT:0x%x STATE:0x%x)\n",
++					status >> 16, cmd->opcode, cmd->arg, status, sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE));
++				fflush(stdout);
++				sdhc_bcm2712_write(dev, status, SDHCI_INT_STATUS);
++				sdhc_bcm2712_recover_error(dev, status);
++				return -EIO;
++			}
++			uint32_t state = sdhc_bcm2712_read(dev, SDHCI_PRESENT_STATE);
++			/* Check Command Inhibit DAT (BIT 1), DAT Line Active (BIT 2), Write Active (BIT 8), Read Active (BIT 9) are all 0, and DAT0 (BIT 20) is HIGH */
++			if ((state & (BIT(1) | BIT(2) | BIT(8) | BIT(9))) == 0 && (state & BIT(20)) != 0) {
++				sdhc_bcm2712_write(dev, BIT(1) | BIT(4) | BIT(5), SDHCI_INT_STATUS);
++				break;
++			}
++			k_busy_wait(5);
++			if (--timeout == 0) {
++				printf("SDHC: Transfer Complete timeout (CMD%d arg 0x%x read:%d blks:%d sz:%d done:%d INT:0x%x STATE:0x%x)\n",
++					cmd->opcode, cmd->arg, is_read, data->blocks, data->block_size,
++					bytes_done, status, state);
++				fflush(stdout);
++				/* Perform error recovery reset to unblock the data engine (0x00100000 = Data Timeout) */
++				sdhc_bcm2712_recover_error(dev, 0x00100000);
++				return -ETIMEDOUT;
++			}
++		}
++		data->bytes_xfered = bytes_done;
 +	}
 +
 +	/* Wait for the card to stabilize its internal state machine after CMD0 */
@@ -365,11 +561,11 @@ index 00000000000..6c5106c9285
 +	/* Do not set SDIO_CFG_SD_PIN_SEL_SD for non-removable SDIO */
 +	sys_write32(pin_sel, DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 +
-+	/* Get base clock from Capabilities register */
++	/* Get base clock (BCM2712 SDIO base clock is 200MHz) */
 +	caps = sys_read32(DEVICE_MMIO_GET(dev) + SDHCI_CAPABILITIES);
 +	base_clk = ((caps >> 8) & 0xFF) * 1000000;
-+	if (base_clk == 0) {
-+		base_clk = 100000000; /* Fallback to 100MHz */
++	if (base_clk == 0 || base_clk < 200000000) {
++		base_clk = 200000000; /* BCM2712 SDIO base clock is 200MHz */
 +	}
 +
 +	/* Calculate divisor */
@@ -539,7 +735,7 @@ index 00000000000..6c5106c9285
 +
 +	memset(props, 0, sizeof(struct sdhc_host_props));
 +	props->f_min = SDMMC_CLOCK_400KHZ;
-+	props->f_max = SD_CLOCK_25MHZ;
++	props->f_max = 12500000; /* Test with 12.5MHz for robust SDIO signal timing */
 +	props->power_delay = config->power_delay_ms;
 +	props->host_caps.vol_180_support = true;
 +	props->host_caps.vol_330_support = false;
@@ -568,9 +764,61 @@ index 00000000000..6c5106c9285
 +	return 0;
 +}
 +
++static void bcm2712_configure_pinctrl(void)
++{
++	mm_reg_t pinctrl_base;
++	uintptr_t phys_addr = 0x107d504100;
++	size_t size = 0x20;
++
++	device_map(&pinctrl_base, phys_addr, size, K_MEM_CACHE_NONE);
++
++	printk("Mapped BCM2712 pinctrl at 0x%lx\n", (unsigned long)pinctrl_base);
++
++	/* 1. Configure Function Select (Mux) registers for BCM2712 D0:
++	 * Offset 0x08 controls Pin 28, 29, 30, 31:
++	 *   Pin 28: bits 19-16 -> 0 (GPIO)
++	 *   Pin 29: bits 23-20 -> 0 (GPIO)
++	 *   Pin 30: bits 27-24 -> 1 (sd2)
++	 *   Pin 31: bits 31-28 -> 1 (sd2)
++	 */
++	uint32_t val = sys_read32(pinctrl_base + 0x08);
++	val &= 0x0000FFFF;
++	val |= 0x11000000;
++	sys_write32(val, pinctrl_base + 0x08);
++
++	/* Offset 0x0C controls Pin 32, 33, 34, 35:
++	 *   Pin 32-35: bits 15-0 -> 1 (sd2)
++	 */
++	val = sys_read32(pinctrl_base + 0x0C);
++	val &= 0xFFFF0000;
++	val |= 0x1111;
++	sys_write32(val, pinctrl_base + 0x0C);
++
++	/* 2. Configure Pull (Bias) registers for BCM2712 D0:
++	 * Offset 0x14 controls Pin 28-32 pull-up/pull-down:
++	 *   Pin 31, 32 -> 2 (Pull-Up), Pin 30 (CLK) -> 0 (None)
++	 */
++	val = sys_read32(pinctrl_base + 0x14);
++	val &= 0x000FFFFF;
++	val |= 0x28000000;
++	sys_write32(val, pinctrl_base + 0x14);
++
++	/* Offset 0x18 controls Pin 33-35 pull-up/pull-down:
++	 *   Pin 33-35 -> 2 (Pull-Up)
++	 */
++	val = sys_read32(pinctrl_base + 0x18);
++	val &= 0xFFFFFFC0;
++	val |= 0x2A;
++	sys_write32(val, pinctrl_base + 0x18);
++
++	printk("BCM2712 SDIO pinctrl configured successfully in SDHC driver init!\n");
++}
++
 +static int sdhc_bcm2712_init(const struct device *dev)
 +{
 +	uint32_t pin_sel;
++
++	bcm2712_configure_pinctrl();
 +
 +	DEVICE_MMIO_MAP(dev, K_MEM_CACHE_NONE);
 +
@@ -580,6 +828,9 @@ index 00000000000..6c5106c9285
 +	/* Log the initial value of SDIO_CFG_SD_PIN_SEL register */
 +	pin_sel = sys_read32(DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 +	printk("Initial SDIO_CFG_SD_PIN_SEL: 0x%x\n", pin_sel);
++
++	/* Ensure SDIO_CFG_SD_PIN_SEL is set to 1 for slot 1 */
++	sys_write32(0x1, DEVICE_MMIO_GET(dev) + SDIO_CFG_SD_PIN_SEL);
 +
 +	return sdhc_bcm2712_reset_internal(dev);
 +}
@@ -611,6 +862,389 @@ index 00000000000..6c5106c9285
 +			      &sdhc_bcm2712_api);
 +
 +DT_INST_FOREACH_STATUS_OKAY(SDHC_BCM2712_INIT)
+diff --git a/drivers/wifi/infineon/airoc_whd_hal_common.c b/drivers/wifi/infineon/airoc_whd_hal_common.c
+index e74e33edca1..f23a57d4f97 100644
+--- a/drivers/wifi/infineon/airoc_whd_hal_common.c
++++ b/drivers/wifi/infineon/airoc_whd_hal_common.c
+@@ -11,9 +11,42 @@
+ #include <zephyr/kernel.h>
+ #include <zephyr/drivers/gpio.h>
+ #include <zephyr/logging/log.h>
++#include <zephyr/sys/sys_io.h>
++#include <zephyr/sys/device_mmio.h>
+ 
+ LOG_MODULE_DECLARE(infineon_airoc_wifi, CONFIG_WIFI_LOG_LEVEL);
+ 
++static void airoc_configure_bcm2712_pinctrl(void)
++{
++	mm_reg_t pinctrl_base;
++	uintptr_t phys_addr = 0x107d504100ULL;
++	size_t size = 0x20;
++
++	device_map(&pinctrl_base, phys_addr, size, K_MEM_CACHE_NONE);
++
++	uint32_t val = sys_read32(pinctrl_base + 0x08);
++	val &= 0x0000FFFF;
++	val |= 0x11000000; /* Pins 30, 31 = sd2; Pins 28, 29 = GPIO */
++	sys_write32(val, pinctrl_base + 0x08);
++
++	val = sys_read32(pinctrl_base + 0x0C);
++	val &= 0xFFFF0000;
++	val |= 0x00001111; /* Pins 32-35 = sd2 */
++	sys_write32(val, pinctrl_base + 0x0C);
++
++	val = sys_read32(pinctrl_base + 0x14);
++	val &= ~0xFFF00000;
++	val |= 0x28000000; /* Pin 31, 32 = Pull-Up, Pin 30 = None */
++	sys_write32(val, pinctrl_base + 0x14);
++
++	val = sys_read32(pinctrl_base + 0x18);
++	val &= ~0x0000003F;
++	val |= 0x0000002A; /* Pins 33-35 = Pull-Up */
++	sys_write32(val, pinctrl_base + 0x18);
++
++	device_unmap(pinctrl_base, size);
++}
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -28,8 +61,16 @@ int airoc_wifi_power_on(const struct device *dev)
+ 	int ret;
+ 	const struct airoc_wifi_config *config = dev->config;
+ 
++	printk("AIROC: Power on checking wifi_reg_on port: %s pin %d\n",
++		config->wifi_reg_on_gpio.port ? config->wifi_reg_on_gpio.port->name : "NULL",
++		config->wifi_reg_on_gpio.pin);
++
++	airoc_configure_bcm2712_pinctrl();
++
+ 	/* Check WIFI REG_ON gpio instance */
+ 	if (!device_is_ready(config->wifi_reg_on_gpio.port)) {
++		printk("AIROC Error: gpio port %s is not ready!\n",
++			config->wifi_reg_on_gpio.port ? config->wifi_reg_on_gpio.port->name : "NULL");
+ 		LOG_ERR("Error: failed to configure wifi_reg_on %s pin %d",
+ 			config->wifi_reg_on_gpio.port->name, config->wifi_reg_on_gpio.pin);
+ 		return -EIO;
+@@ -38,24 +79,35 @@ int airoc_wifi_power_on(const struct device *dev)
+ 	/* Configure wifi_reg_on as output  */
+ 	ret = gpio_pin_configure_dt(&config->wifi_reg_on_gpio, GPIO_OUTPUT);
+ 	if (ret) {
++		printk("AIROC Error: gpio_pin_configure_dt failed: %d\n", ret);
+ 		LOG_ERR("Error %d: failed to configure wifi_reg_on %s pin %d", ret,
+ 			config->wifi_reg_on_gpio.port->name, config->wifi_reg_on_gpio.pin);
+ 		return ret;
+ 	}
+ 	ret = gpio_pin_set_dt(&config->wifi_reg_on_gpio, 0);
+ 	if (ret) {
++		printk("AIROC Error: gpio_pin_set_dt(0) failed: %d\n", ret);
+ 		return ret;
+ 	}
+ 
++	printk("AIROC: Power cycling WL_ON (LOW for %d ms)...\n", WLAN_CBUCK_DISCHARGE_MS);
+ 	/* Allow CBUCK regulator to discharge */
+ 	k_msleep(WLAN_CBUCK_DISCHARGE_MS);
+ 
+ 	/* WIFI power on */
+ 	ret = gpio_pin_set_dt(&config->wifi_reg_on_gpio, 1);
+ 	if (ret) {
++		printk("AIROC Error: gpio_pin_set_dt(1) failed: %d\n", ret);
+ 		return ret;
+ 	}
++
++	/* Also enable BT_ON (GPIO 29) to power full chip subsystem */
++	gpio_pin_configure(config->wifi_reg_on_gpio.port, 29, GPIO_OUTPUT_HIGH);
++	gpio_pin_set(config->wifi_reg_on_gpio.port, 29, 1);
++	printk("AIROC: WL_ON (GPIO 28) and BT_ON (GPIO 29) set HIGH (waiting %d ms)...\n", WLAN_POWER_UP_DELAY_MS);
+ 	k_msleep(WLAN_POWER_UP_DELAY_MS);
++#else
++	printk("AIROC: No wifi_reg_on_gpios property defined!\n");
+ #endif /* DT_INST_NODE_HAS_PROP(0, reg_on_gpios) */
+ 
+ 	return 0;
+diff --git a/drivers/wifi/infineon/airoc_whd_hal_sdio.c b/drivers/wifi/infineon/airoc_whd_hal_sdio.c
+index cf9f254be42..cfcf803d203 100644
+--- a/drivers/wifi/infineon/airoc_whd_hal_sdio.c
++++ b/drivers/wifi/infineon/airoc_whd_hal_sdio.c
+@@ -58,69 +58,122 @@ int airoc_wifi_init_primary(const struct device *dev, whd_interface_t *interface
+ 	whd_sdio_config.oob_config = oob_config;
+ #endif
+ 
+-	if (airoc_wifi_power_on(dev)) {
+-		LOG_ERR("airoc_wifi_power_on returns fail");
+-		return -ENODEV;
++	printf("AIROC: Calling airoc_wifi_power_on...\n");
++	fflush(stdout);
++	ret = airoc_wifi_power_on(dev);
++	if (ret) {
++		printf("AIROC: airoc_wifi_power_on failed with error %d\n", ret);
++		fflush(stdout);
++		LOG_ERR("airoc_wifi_power_on returns fail: %d", ret);
++		return ret;
+ 	}
+ 
++	printf("AIROC: Checking bus_sdio device readiness (%s)...\n",
++		config->bus_dev.bus_sdio ? config->bus_dev.bus_sdio->name : "NULL");
++	fflush(stdout);
+ 	if (!device_is_ready(config->bus_dev.bus_sdio)) {
++		printf("AIROC: SDHC device %s is NOT ready!\n",
++			config->bus_dev.bus_sdio ? config->bus_dev.bus_sdio->name : "NULL");
++		fflush(stdout);
+ 		LOG_ERR("SDHC device is not ready");
+ 		return -ENODEV;
+ 	}
+ 
++	printf("AIROC: Calling sd_init on %s...\n", config->bus_dev.bus_sdio->name);
++	fflush(stdout);
+ 	ret = sd_init(config->bus_dev.bus_sdio, &data->card);
++	printf("AIROC: sd_init returned %d (card status %d)\n", ret, data->card.status);
++	fflush(stdout);
+ 	if (ret) {
+ 		return ret;
+ 	}
+ 
+ 	/* Init SDIO functions */
++	printf("AIROC: Initializing SDIO Func 0 (BUS)...\n");
++	fflush(stdout);
+ 	ret = sdio_init_func(&data->card, &data->card.func0, BUS_FUNCTION);
+ 	if (ret) {
++		printf("AIROC Error: sdio_init_func BUS_FUNCTION failed: %d\n", ret);
++		fflush(stdout);
+ 		LOG_ERR("sdio_enable_func BUS_FUNCTION, error: %x", ret);
+ 		return ret;
+ 	}
++	printf("AIROC: Initializing SDIO Func 1 (BACKPLANE)...\n");
++	fflush(stdout);
+ 	ret = sdio_init_func(&data->card, &data->sdio_func1, BACKPLANE_FUNCTION);
+ 	if (ret) {
++		printf("AIROC Error: sdio_init_func BACKPLANE_FUNCTION failed: %d\n", ret);
++		fflush(stdout);
+ 		LOG_ERR("sdio_enable_func BACKPLANE_FUNCTION, error: %x", ret);
+ 		return ret;
+ 	}
++	printf("AIROC: Initializing SDIO Func 2 (WLAN)...\n");
++	fflush(stdout);
+ 	ret = sdio_init_func(&data->card, &data->sdio_func2, WLAN_FUNCTION);
+ 	if (ret) {
++		printf("AIROC Error: sdio_init_func WLAN_FUNCTION failed: %d\n", ret);
++		fflush(stdout);
+ 		LOG_ERR("sdio_enable_func WLAN_FUNCTION, error: %x", ret);
+ 		return ret;
+ 	}
+ 	ret = sdio_set_block_size(&data->sdio_func1, SDIO_64B_BLOCK);
+ 	if (ret) {
++		printf("AIROC Error: sdio_set_block_size Func 1 failed: %d\n", ret);
++		fflush(stdout);
+ 		LOG_ERR("Can't set block size for BACKPLANE_FUNCTION, error: %x", ret);
+ 		return ret;
+ 	}
+ 	ret = sdio_set_block_size(&data->sdio_func2, SDIO_64B_BLOCK);
+ 	if (ret) {
++		printf("AIROC Error: sdio_set_block_size Func 2 failed: %d\n", ret);
++		fflush(stdout);
+ 		LOG_ERR("Can't set block size for WLAN_FUNCTION, error: %x", ret);
+ 		return ret;
+ 	}
+ 	ret = sdio_set_block_size(&data->card.func0, data->card.func0.cis.max_blk_size);
+ 	if (ret) {
++		printf("AIROC Error: sdio_set_block_size Func 0 failed: %d\n", ret);
++		fflush(stdout);
+ 		LOG_ERR("Can't set block size for BUS_FUNCTION, error: %x", ret);
+ 		return ret;
+ 	}
+ 
++	printf("AIROC: Calling whd_init...\n");
++	fflush(stdout);
+ 	/* Init wifi host driver (whd) */
+ 	cy_rslt_t whd_ret = whd_init(&data->whd_drv, &init_config_default, &resource_ops, buffer_if,
+ 				     netif_funcs);
++	printf("AIROC: whd_init returned 0x%08x\n", whd_ret);
++	fflush(stdout);
+ 	if (whd_ret == CY_RSLT_SUCCESS) {
++		printf("AIROC: Calling whd_bus_sdio_attach...\n");
++		fflush(stdout);
+ 		whd_ret = whd_bus_sdio_attach(data->whd_drv, &whd_sdio_config,
+ 					      (whd_sdio_t)&data->card);
++		printf("AIROC: whd_bus_sdio_attach returned 0x%08x\n", whd_ret);
++		fflush(stdout);
+ 
+ 		if (whd_ret == CY_RSLT_SUCCESS) {
++			printf("AIROC: Calling whd_wifi_on (downloading firmware & booting chip)...\n");
++			fflush(stdout);
+ 			whd_ret = whd_wifi_on(data->whd_drv, interface);
++			printf("AIROC: whd_wifi_on returned 0x%08x\n", whd_ret);
++			fflush(stdout);
+ 		}
+ 
+ 		if (whd_ret != CY_RSLT_SUCCESS) {
++			printf("AIROC Error: whd init sequence failed with 0x%08x\n", whd_ret);
++			fflush(stdout);
+ 			whd_deinit(*interface);
+ 			return -ENODEV;
+ 		}
++	} else {
++		printf("AIROC Error: whd_init failed with 0x%08x\n", whd_ret);
++		fflush(stdout);
++		return -ENODEV;
+ 	}
++	printf("AIROC: airoc_wifi_init_primary SUCCESS!\n");
++	fflush(stdout);
+ 	return 0;
+ }
+ 
+@@ -175,13 +228,44 @@ whd_result_t whd_bus_sdio_cmd53(whd_driver_t whd_driver, whd_bus_transfer_direct
+ 	whd_result_t ret;
+ 	struct sd_card *sd = whd_driver->bus_priv->sdio_obj;
+ 	struct sdio_func *func = airoc_wifi_get_sdio_func(sd, function);
++	static uint8_t cmd53_bounce_buf[4096] __attribute__((aligned(64)));
++
++	if (!func || !func->block_size) {
++		return WHD_BADARG;
++	}
++
++	uint16_t xfer_size = data_size;
++	uint8_t *xfer_buf = data;
++
++	if (mode == SDIO_BLOCK_MODE && (data_size % func->block_size) != 0) {
++		xfer_size = (data_size + func->block_size - 1) & ~(func->block_size - 1);
++		if (xfer_size <= sizeof(cmd53_bounce_buf)) {
++			xfer_buf = cmd53_bounce_buf;
++			if (direction == BUS_WRITE) {
++				memset(cmd53_bounce_buf, 0, xfer_size);
++				memcpy(cmd53_bounce_buf, data, data_size);
++			}
++		} else {
++			xfer_size = data_size;
++		}
++	}
+ 
+ 	if (direction == BUS_WRITE) {
+ 		WHD_BUS_STATS_INCREMENT_VARIABLE(whd_driver->bus_priv, cmd53_write);
+-		ret = sdio_write_addr(func, address, data, data_size);
++		ret = sdio_write_addr(func, address, xfer_buf, xfer_size);
+ 	} else {
+ 		WHD_BUS_STATS_INCREMENT_VARIABLE(whd_driver->bus_priv, cmd53_read);
+-		ret = sdio_read_addr(func, address, data, data_size);
++		ret = sdio_read_addr(func, address, xfer_buf, xfer_size);
++		if (ret == WHD_SUCCESS && xfer_buf != data) {
++			memcpy(data, cmd53_bounce_buf, data_size);
++		}
++	}
++
++	if (ret != WHD_SUCCESS) {
++		printf("AIROC CMD53 FAIL: dir=%d fn=%d mode=%d addr=0x%x sz=%d (xfer=%d blk_size=%d) ret=%d\n",
++		       direction, function, mode, address, data_size, xfer_size,
++		       func ? func->block_size : -1, ret);
++		fflush(stdout);
+ 	}
+ 
+ 	WHD_BUS_STATS_CONDITIONAL_INCREMENT_VARIABLE(
+diff --git a/drivers/wifi/infineon/airoc_wifi.c b/drivers/wifi/infineon/airoc_wifi.c
+index 674e56e5dcd..f6b44968aa8 100644
+--- a/drivers/wifi/infineon/airoc_wifi.c
++++ b/drivers/wifi/infineon/airoc_wifi.c
+@@ -295,10 +295,12 @@ static whd_security_t convert_zephyr_security_to_whd(int security)
+ 		break;
+ 
+ 	case WIFI_SECURITY_TYPE_PSK_SHA256:
+-		whd_security = WIFI_SECURITY_TYPE_PSK_SHA256;
++		whd_security = WHD_SECURITY_WPA2_AES_PSK_SHA256;
+ 		break;
+ 
+ 	case WIFI_SECURITY_TYPE_SAE:
++	case WIFI_SECURITY_TYPE_SAE_H2E:
++	case WIFI_SECURITY_TYPE_SAE_AUTO:
+ 		whd_security = WHD_SECURITY_WPA3_SAE;
+ 		break;
+ 
+@@ -901,10 +903,10 @@ static int airoc_mgmt_connect(const struct device *dev,
+ {
+ 	struct airoc_wifi_data *data = (struct airoc_wifi_data *)dev->data;
+ 	int ret = 0;
+-	whd_scan_result_t scan_result;
++	static whd_scan_result_t scan_result;
+ 	whd_scan_result_t usr_result = {0};
+ 	/* Try to scan ssid to define security */
+-	whd_scan_result_t tmp_result = {0};
++	static whd_scan_result_t tmp_result;
+ 	const uint8_t *security_key;
+ 	uint8_t key_length;
+ 
+@@ -929,10 +931,15 @@ static int airoc_mgmt_connect(const struct device *dev,
+ 	usr_result.security = convert_zephyr_security_to_whd(params->security);
+ 
+ 	if (is_invalid_security(params->security, params->psk_length)) {
+-
+-		if (whd_wifi_scan(airoc_sta_if, WHD_SCAN_TYPE_ACTIVE, WHD_BSS_TYPE_ANY, NULL, NULL,
+-				  NULL, NULL, airoc_wifi_scan_cb_search, &scan_result,
+-				  &(tmp_result)) != WHD_SUCCESS) {
++		memset(&scan_result, 0, sizeof(scan_result));
++		memset(&tmp_result, 0, sizeof(tmp_result));
++		tmp_result.SSID = usr_result.SSID;
++		tmp_result.security = WHD_SECURITY_UNKNOWN;
++		k_sem_reset(&airoc_wifi_data.sema_scan);
++
++		if (whd_wifi_scan(airoc_sta_if, WHD_SCAN_TYPE_ACTIVE, WHD_BSS_TYPE_ANY,
++				  &usr_result.SSID, NULL, NULL, NULL, airoc_wifi_scan_cb_search,
++				  &scan_result, &(tmp_result)) != WHD_SUCCESS) {
+ 			LOG_ERR("Failed start scan");
+ 			ret = -EAGAIN;
+ 			goto error;
+@@ -941,19 +948,19 @@ static int airoc_mgmt_connect(const struct device *dev,
+ 		if (k_sem_take(&airoc_wifi_data.sema_scan, K_MSEC(AIROC_WIFI_SCAN_TIMEOUT_MS)) !=
+ 		    0) {
+ 			whd_wifi_stop_scan(airoc_sta_if);
+-			ret = -EAGAIN;
+-			goto error;
+ 		}
+-	} else {
+-		/* Fallback to user input */
+-		if (tmp_result.security == WHD_SECURITY_UNKNOWN) {
++
++		if (tmp_result.security != WHD_SECURITY_UNKNOWN) {
+ 			usr_result.security = tmp_result.security;
++		} else {
++			LOG_WRN("SSID security not found via scan, defaulting to WPA2-AES-PSK");
++			usr_result.security = WHD_SECURITY_WPA2_AES_PSK;
+ 		}
+ 	}
+ 
+ 	if (usr_result.security == WHD_SECURITY_UNKNOWN) {
+ 		ret = -EAGAIN;
+-		LOG_ERR("Could not scan device");
++		LOG_ERR("Could not determine security type");
+ 		goto error;
+ 	}
+ 
+@@ -963,17 +970,23 @@ static int airoc_mgmt_connect(const struct device *dev,
+ 	}
+ 
+ 	if (usr_result.security == WHD_SECURITY_WPA3_SAE) {
+-		security_key = params->sae_password;
+-		key_length = params->sae_password_length;
++		security_key = params->sae_password ? params->sae_password : params->psk;
++		key_length = params->sae_password ? params->sae_password_length : params->psk_length;
+ 	} else {
+ 		security_key = params->psk;
+ 		key_length = params->psk_length;
+ 	}
+ 
++	LOG_INF("Connecting to SSID '%.*s' (security=0x%x, key_len=%u)...",
++		usr_result.SSID.length, usr_result.SSID.value,
++		(unsigned int)usr_result.security, key_length);
++
+ 	/* Connect to the network */
+-	if (whd_wifi_join(airoc_sta_if, &usr_result.SSID, usr_result.security,
+-			  security_key, key_length) != WHD_SUCCESS) {
+-		LOG_ERR("Failed to connect with network");
++	whd_result_t join_res = whd_wifi_join(airoc_sta_if, &usr_result.SSID, usr_result.security,
++					      security_key, key_length);
++	if (join_res != WHD_SUCCESS) {
++		LOG_ERR("Failed to connect with network (whd_wifi_join ret=0x%08x)",
++			(unsigned int)join_res);
+ 
+ 		ret = -EAGAIN;
+ 		goto error;
 diff --git a/dts/arm64/broadcom/bcm2712.dtsi b/dts/arm64/broadcom/bcm2712.dtsi
 index 1b151a1da1a..5dea3cd6dc3 100644
 --- a/dts/arm64/broadcom/bcm2712.dtsi
@@ -684,20 +1318,38 @@ index 00000000000..a7e929208f7
 +    required: true
 +  clocks:
 +    required: true
+diff --git a/samples/hello_world/CMakeLists.txt b/samples/hello_world/CMakeLists.txt
+index ecb7d24bb8f..00790528cd1 100644
+--- a/samples/hello_world/CMakeLists.txt
++++ b/samples/hello_world/CMakeLists.txt
+@@ -2,6 +2,10 @@
+ 
+ cmake_minimum_required(VERSION 3.20.0)
+ 
++set(FW_IMAGE_NAME "${CMAKE_CURRENT_SOURCE_DIR}/firmware/brcmfmac43455-sdio.bin" CACHE FILEPATH "Firmware binary")
++set(CLM_IMAGE_NAME "${CMAKE_CURRENT_SOURCE_DIR}/firmware/brcmfmac43455-sdio.clm_blob" CACHE FILEPATH "CLM blob")
++set(NVRAM_IMAGE_NAME "${CMAKE_CURRENT_SOURCE_DIR}/firmware/brcmfmac43455-sdio.txt" CACHE FILEPATH "NVRAM config")
++
+ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+ project(hello_world)
+ 
 diff --git a/samples/hello_world/prj.conf b/samples/hello_world/prj.conf
-index b2a4ba59104..5305ff780f5 100644
+index b2a4ba59104..f6e6f5ad8b7 100644
 --- a/samples/hello_world/prj.conf
 +++ b/samples/hello_world/prj.conf
-@@ -1 +1,16 @@
+@@ -1 +1,109 @@
  # nothing here
 +CONFIG_SDHC=y
 +CONFIG_SDHC_BCM2712=y
 +CONFIG_SDIO_STACK=y
 +CONFIG_LOG=y
-+CONFIG_SDHC_LOG_LEVEL_DBG=y
-+CONFIG_SD_LOG_LEVEL_DBG=y
++CONFIG_LOG_MODE_IMMEDIATE=y
++CONFIG_LOG_BUFFER_SIZE=8192
++CONFIG_SDHC_LOG_LEVEL_INF=y
++CONFIG_SD_LOG_LEVEL_INF=y
 +CONFIG_MAX_XLAT_TABLES=24
 +CONFIG_GPIO=y
++CONFIG_HEAP_MEM_POOL_SIZE=131072
 +
 +# Zephyr Shell configurations
 +CONFIG_SHELL=y
@@ -705,12 +1357,101 @@ index b2a4ba59104..5305ff780f5 100644
 +CONFIG_SHELL_BACKEND_SERIAL=y
 +CONFIG_SHELL_ARGC_MAX=10
 +CONFIG_SHELL_BACKEND_SERIAL_API_POLLING=y
-\ No newline at end of file
++
++# AIROC WiFi Stack
++CONFIG_WIFI=y
++CONFIG_WIFI_AIROC=y
++CONFIG_AIROC_WIFI_CUSTOM=y
++
++# Networking Stack
++CONFIG_NETWORKING=y
++CONFIG_NET_L2_ETHERNET=y
++CONFIG_NET_L2_WIFI_MGMT=y
++CONFIG_NET_IPV4=y
++CONFIG_NET_DHCPV4=y
++CONFIG_WIFI_STA_AUTO_DHCPV4=y
++CONFIG_NET_SHELL=y
++CONFIG_NET_L2_WIFI_SHELL=y
++CONFIG_WIFI_LOG_LEVEL_INF=y
++
++# 64-bit ARM Stack Sizes (prevent stack overflow into adjacent stacks)
++CONFIG_SHELL_STACK_SIZE=16384
++CONFIG_NET_MGMT_EVENT_STACK_SIZE=4096
++CONFIG_NET_RX_STACK_SIZE=8192
++CONFIG_NET_TX_STACK_SIZE=8192
++CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=8192
++CONFIG_AIROC_WIFI_EVENT_TASK_STACK_SIZE=4096
++CONFIG_MAIN_STACK_SIZE=4096
++CONFIG_ISR_STACK_SIZE=4096
++CONFIG_NET_SOCKETS_SERVICE_STACK_SIZE=8192
++CONFIG_NET_TCP_WORKQ_STACK_SIZE=8192
++
++# DNS リゾルバの有効化（DHCP で取得した DNS サーバーを自動使用、フォールバックに 8.8.8.8）
++CONFIG_DNS_RESOLVER=y
++CONFIG_DNS_RESOLVER_MAX_SERVERS=2
++CONFIG_DNS_NUM_CONCUR_QUERIES=2
++CONFIG_DNS_SERVER_IP_ADDRESSES=y
++CONFIG_DNS_SERVER1="8.8.8.8"
++
++# TCP プロトコルスタックの有効化
++CONFIG_NET_TCP=y
++CONFIG_NET_MAX_CONTEXTS=10
++CONFIG_NET_TCP_INIT_RETRANSMISSION_TIMEOUT=1000
++CONFIG_NET_SOCKETS_CONNECT_TIMEOUT=15000
++
++# HTTP クライアントおよび URL パーサーの有効化
++CONFIG_HTTP_CLIENT=y
++CONFIG_NET_SHELL_HTTP_CLIENT_URL_LEN=256
++
++# HTTPS (TLS 1.2 & TLS 1.3) サポート
++CONFIG_NET_SOCKETS_SOCKOPT_TLS=y
++CONFIG_TLS_CREDENTIALS=y
++CONFIG_NET_SOCKETS_TLS_MAX_CONTEXTS=4
++
++# Mbed TLS & PSA Crypto 設定
++CONFIG_MBEDTLS=y
++CONFIG_MBEDTLS_BUILTIN=y
++CONFIG_MBEDTLS_ENABLE_HEAP=y
++CONFIG_MBEDTLS_HEAP_SIZE=131072
++CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
++CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
++CONFIG_MBEDTLS_PEM_PARSE_C=y
++CONFIG_MBEDTLS_PEM_WRITE_C=y
++CONFIG_MBEDTLS_SSL_SERVER_NAME_INDICATION=y
++CONFIG_PSA_CRYPTO=y
++CONFIG_ENTROPY_GENERATOR=y
++
++# 楕円曲線 (Curves) サポート (secp256r1, secp384r1, secp521r1, X25519)
++CONFIG_PSA_WANT_ECC_SECP_R1_256=y
++CONFIG_PSA_WANT_ECC_SECP_R1_384=y
++CONFIG_PSA_WANT_ECC_SECP_R1_521=y
++CONFIG_PSA_WANT_ECC_MONTGOMERY_255=y
++
++# TLS 1.2 & TLS 1.3 プロトコル有効化
++CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
++CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y
++CONFIG_MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED=y
++
++# TLS 1.3 暗号スイート
++CONFIG_MBEDTLS_CIPHERSUITE_TLS1_3_AES_128_GCM_SHA256=y
++CONFIG_MBEDTLS_CIPHERSUITE_TLS1_3_AES_256_GCM_SHA384=y
++
++# TLS 1.2 暗号スイート (RSA / ECDSA, AES-GCM, SHA-256 / SHA-384 完全対応)
++CONFIG_MBEDTLS_CIPHERSUITE_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256=y
++CONFIG_MBEDTLS_CIPHERSUITE_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256=y
++CONFIG_MBEDTLS_CIPHERSUITE_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384=y
++CONFIG_MBEDTLS_CIPHERSUITE_TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384=y
++
++# パケットおよびネットバッファプールの拡張（TCP 通信・HTTP 受信時のバッファ枯渇防止）
++CONFIG_NET_PKT_RX_COUNT=32
++CONFIG_NET_BUF_RX_COUNT=128
++CONFIG_NET_PKT_TX_COUNT=32
++CONFIG_NET_BUF_TX_COUNT=128
 diff --git a/samples/hello_world/src/main.c b/samples/hello_world/src/main.c
-index c550ab461cb..b60248958dc 100644
+index c550ab461cb..23d5c7233df 100644
 --- a/samples/hello_world/src/main.c
 +++ b/samples/hello_world/src/main.c
-@@ -1,14 +1,224 @@
+@@ -1,14 +1,258 @@
  /*
   * Copyright (c) 2012-2014 Wind River Systems, Inc.
 + * Copyright 2026 matsuoka
@@ -720,7 +1461,8 @@ index c550ab461cb..b60248958dc 100644
  
  #include <stdio.h>
 +#include <stdlib.h>
-+
+ 
+-int main(void)
 +#include <zephyr/kernel.h>
 +#include <zephyr/sys/sys_io.h>
 +#include <zephyr/sys/device_mmio.h>
@@ -917,8 +1659,41 @@ index c550ab461cb..b60248958dc 100644
 +	return 0;
 +}
 +
++extern char g_airoc_boot_log[4096];
++
++static void print_airoc_boot_log(void)
+ {
+-	printf("Hello World! %s\n", CONFIG_BOARD_TARGET);
++	printk("\n=== AIROC BOOT DIAGNOSTIC LOG ===\n");
++	const char *p = g_airoc_boot_log;
++	char line[160];
++	while (*p) {
++		size_t i = 0;
++		while (*p && *p != '\n' && i < sizeof(line) - 1) {
++			line[i++] = *p++;
++		}
++		if (*p == '\n') {
++			p++;
++		}
++		line[i] = '\0';
++		printk("%s\n", line);
++		k_msleep(5);
++	}
++	printk("=================================\n");
++}
+ 
++static int cmd_sdio_log(const struct shell *sh, size_t argc, char **argv)
++{
++	ARG_UNUSED(sh);
++	ARG_UNUSED(argc);
++	ARG_UNUSED(argv);
++	print_airoc_boot_log();
+ 	return 0;
+ }
++
 +/* Register subcommands and root command 'sdio' */
 +SHELL_STATIC_SUBCMD_SET_CREATE(sub_sdio,
++	SHELL_CMD(log, NULL, "Print AIROC boot diagnostic log", cmd_sdio_log),
 +	SHELL_CMD(pinctrl, NULL, "Configure BCM2712 SDIO Pin Muxing", cmd_sdio_pinctrl),
 +	SHELL_CMD_ARG(power, NULL, "Set WL_ON (GPIO 28) <on/off>", cmd_sdio_power, 2, 0),
 +	SHELL_CMD(init, NULL, "Initialize SDIO WiFi Card", cmd_sdio_init),
@@ -928,14 +1703,113 @@ index c550ab461cb..b60248958dc 100644
 +);
 +
 +SHELL_CMD_REGISTER(sdio, &sub_sdio, "BCM2712 SDIO Control Commands", NULL);
- 
- int main(void)
- {
- 	printf("Hello World! %s\n", CONFIG_BOARD_TARGET);
--
- 	return 0;
- }
 +
++int main(void)
++{
++	printf("Starting Zephyr on %s with Infineon AIROC WiFi...\n", CONFIG_BOARD_TARGET);
++	configure_bcm2712_pinctrl();
++	print_airoc_boot_log();
++	return 0;
++}
++
+diff --git a/subsys/net/lib/shell/http_client.c b/subsys/net/lib/shell/http_client.c
+index 8eb71ba62a0..732342d8765 100644
+--- a/subsys/net/lib/shell/http_client.c
++++ b/subsys/net/lib/shell/http_client.c
+@@ -251,11 +251,20 @@ static int http_client_connect_setup(struct http_client_sh_ctx *ctx)
+ 	const struct shell *sh = ctx->sh;
+ 	bool is_ssl = ctx->url_fields.is_ssl;
+ 
+-	ctx->sockfd = zsock_socket(ctx->sa.ss_family, NET_SOCK_STREAM,
+-				   is_ssl ? NET_IPPROTO_TLS_1_2 : NET_IPPROTO_TCP);
++	int proto = NET_IPPROTO_TCP;
++
++	if (is_ssl) {
++#if defined(CONFIG_MBEDTLS_SSL_PROTO_TLS1_3) && !defined(CONFIG_MBEDTLS_SSL_PROTO_TLS1_2)
++		proto = NET_IPPROTO_TLS_1_3;
++#else
++		proto = NET_IPPROTO_TLS_1_2;
++#endif
++	}
++
++	ctx->sockfd = zsock_socket(ctx->sa.ss_family, NET_SOCK_STREAM, proto);
+ 	if (ctx->sockfd < 0) {
+-		PR_ERROR("Failed to create socket (%d)\n", -ECONNABORTED);
+-		return -ECONNABORTED;
++		PR_ERROR("Failed to create socket (%d, errno=%d)\n", ctx->sockfd, errno);
++		return (errno != 0) ? -errno : -ECONNABORTED;
+ 	}
+ 
+ #if defined(CONFIG_NET_SOCKETS_SOCKOPT_TLS)
+@@ -319,20 +328,20 @@ static int http_client_connect(struct http_client_sh_ctx *ctx)
+ 		return -ECONNABORTED;
+ 	}
+ 
++	char ip_str[NET_INET6_ADDRSTRLEN] = { 0 };
++
+ 	if (ctx->sa.ss_family == NET_AF_INET) {
+ 		sa_in = (struct net_sockaddr_in *)(&ctx->sa);
+ 		sa_in->sin_port = net_htons(ctx->url_fields.port);
+-		if (ctx->verbose) {
+-			PR("Connecting to %s:%d\n", net_sprint_ipv4_addr(&sa_in->sin_addr),
+-			   ctx->url_fields.port);
+-		}
++		net_addr_ntop(NET_AF_INET, &sa_in->sin_addr, ip_str, sizeof(ip_str));
++		PR("Connecting to %s:%d (timeout: %d ms)...\n",
++		   ip_str, ctx->url_fields.port, CONFIG_NET_SOCKETS_CONNECT_TIMEOUT);
+ 	} else if (ctx->sa.ss_family == NET_AF_INET6) {
+ 		sa_in6 = (struct net_sockaddr_in6 *)(&ctx->sa);
+ 		sa_in6->sin6_port = net_htons(ctx->url_fields.port);
+-		if (ctx->verbose) {
+-			PR("Connecting to %s:%d\n", net_sprint_ipv6_addr(&sa_in6->sin6_addr),
+-			   ctx->url_fields.port);
+-		}
++		net_addr_ntop(NET_AF_INET6, &sa_in6->sin6_addr, ip_str, sizeof(ip_str));
++		PR("Connecting to [%s]:%d (timeout: %d ms)...\n",
++		   ip_str, ctx->url_fields.port, CONFIG_NET_SOCKETS_CONNECT_TIMEOUT);
+ 	} else {
+ 		PR_ERROR("Invalid IP address family (%d)\n", ctx->sa.ss_family);
+ 		return -EINVAL;
+@@ -340,10 +349,11 @@ static int http_client_connect(struct http_client_sh_ctx *ctx)
+ 
+ 	ret = zsock_connect(ctx->sockfd, net_sad(&ctx->sa), net_family2size(ctx->sa.ss_family));
+ 	if (ret < 0) {
+-		PR_ERROR("Failed to connect to remote (%d)\n", -ECONNABORTED);
++		PR_ERROR("Failed to connect to %s:%d, ret=%d, errno=%d\n",
++			 ip_str, ctx->url_fields.port, ret, errno);
+ 		zsock_close(ctx->sockfd);
+ 		ctx->sockfd = -1;
+-		return -ECONNABORTED;
++		return (errno != 0) ? -errno : -ECONNABORTED;
+ 	}
+ 
+ 	return 0;
+diff --git a/subsys/net/lib/sockets/sockets_tls.c b/subsys/net/lib/sockets/sockets_tls.c
+index cc7c52dcc10..1c7419193ff 100644
+--- a/subsys/net/lib/sockets/sockets_tls.c
++++ b/subsys/net/lib/sockets/sockets_tls.c
+@@ -1832,6 +1832,13 @@ static int tls_mbedtls_handshake(struct tls_context *context,
+ 			/* MbedTLS API documentation requires session to
+ 			 * be reset in other error cases
+ 			 */
++#if defined(MBEDTLS_ERROR_C)
++			char err_buf[128];
++			mbedtls_strerror(ret, err_buf, sizeof(err_buf));
++			printk("[TLS] Handshake error: -0x%x (%s)\n", -ret, err_buf);
++#else
++			printk("[TLS] Handshake error: -0x%x\n", -ret);
++#endif
+ 			NET_ERR("TLS handshake error: -0x%x", -ret);
+ 			ret = tls_mbedtls_reset_session(context);
+ 			if (ret == 0) {
+@@ -1842,6 +1849,7 @@ static int tls_mbedtls_handshake(struct tls_context *context,
+ 		}
+ 
+ 		/* Avoid constant loop if tls_mbedtls_reset_session fails */
++		printk("[TLS] Reset error: -0x%x\n", -ret);
+ 		NET_ERR("TLS reset error: -0x%x", -ret);
+ 		context->error = ECONNABORTED;
+ 		ret = -ECONNABORTED;
 diff --git a/subsys/sd/sd.c b/subsys/sd/sd.c
 index bc752348ee9..3ef7dbbc7d9 100644
 --- a/subsys/sd/sd.c
@@ -984,3 +1858,29 @@ index bc752348ee9..3ef7dbbc7d9 100644
  #ifdef CONFIG_SDMMC_STACK
  	/* Attempt to initialize SDMMC card */
  	if (!sdmmc_card_init(card)) {
+diff --git a/subsys/sd/sdio.c b/subsys/sd/sdio.c
+index 3662a304ad5..5b25a84dac4 100644
+--- a/subsys/sd/sdio.c
++++ b/subsys/sd/sdio.c
+@@ -175,8 +175,7 @@ static int sdio_io_rw_extended_helper(struct sdio_func *func,
+ 		return -EINVAL;
+ 	}
+ 
+-	if ((func->card->cccr_flags & SDIO_SUPPORT_MULTIBLOCK) &&
+-		((len > func->block_size))) {
++	if (func->block_size > 0) {
+ 		/* Use block I/O for r/w where possible */
+ 		while (remaining >= func->block_size) {
+ 			blocks = remaining / func->block_size;
+@@ -195,10 +194,9 @@ static int sdio_io_rw_extended_helper(struct sdio_func *func,
+ 			}
+ 		}
+ 	}
+-	/* Remaining data must be written using byte I/O */
++	/* Remaining data in byte mode */
+ 	while (remaining > 0) {
+ 		size = MIN(remaining, func->cis.max_blk_size);
+-
+ 		ret = sdio_io_rw_extended(func->card, direction, func->num,
+ 			reg_addr, increment, buf, 0, size);
+ 		if (ret) {

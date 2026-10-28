@@ -1,0 +1,15 @@
+# Ignore binary firmware files for license & size reasons
+wifi_enablement/samples/hello_world/firmware/*.bin
+wifi_enablement/samples/hello_world/firmware/*.clm_blob
+wifi_enablement/samples/hello_world/firmware/*.bin_nvram
+
+# Scratch / Temporary files
+scratch_analyze_error.py
+*.org
+*.orig
+*~
+*.swp
+test_write.txt
+wifi_enablement/test_write.txt
+wifi_enablement/samples/hello_world/main.c
+

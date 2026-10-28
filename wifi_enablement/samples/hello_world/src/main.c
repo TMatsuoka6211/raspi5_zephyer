@@ -204,8 +204,40 @@ static int cmd_sdio_write(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+extern char g_airoc_boot_log[4096];
+
+static void print_airoc_boot_log(void)
+{
+	printk("\n=== AIROC BOOT DIAGNOSTIC LOG ===\n");
+	const char *p = g_airoc_boot_log;
+	char line[160];
+	while (*p) {
+		size_t i = 0;
+		while (*p && *p != '\n' && i < sizeof(line) - 1) {
+			line[i++] = *p++;
+		}
+		if (*p == '\n') {
+			p++;
+		}
+		line[i] = '\0';
+		printk("%s\n", line);
+		k_msleep(5);
+	}
+	printk("=================================\n");
+}
+
+static int cmd_sdio_log(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(sh);
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	print_airoc_boot_log();
+	return 0;
+}
+
 /* Register subcommands and root command 'sdio' */
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_sdio,
+	SHELL_CMD(log, NULL, "Print AIROC boot diagnostic log", cmd_sdio_log),
 	SHELL_CMD(pinctrl, NULL, "Configure BCM2712 SDIO Pin Muxing", cmd_sdio_pinctrl),
 	SHELL_CMD_ARG(power, NULL, "Set WL_ON (GPIO 28) <on/off>", cmd_sdio_power, 2, 0),
 	SHELL_CMD(init, NULL, "Initialize SDIO WiFi Card", cmd_sdio_init),
@@ -218,7 +250,9 @@ SHELL_CMD_REGISTER(sdio, &sub_sdio, "BCM2712 SDIO Control Commands", NULL);
 
 int main(void)
 {
-	printf("Hello World! %s\n", CONFIG_BOARD_TARGET);
+	printf("Starting Zephyr on %s with Infineon AIROC WiFi...\n", CONFIG_BOARD_TARGET);
+	configure_bcm2712_pinctrl();
+	print_airoc_boot_log();
 	return 0;
 }
 
